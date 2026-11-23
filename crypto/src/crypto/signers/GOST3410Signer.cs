@@ -7,20 +7,22 @@ using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Signers
 {
-	/**
-	 * Gost R 34.10-94 Signature Algorithm
-	 */
-	public class Gost3410Signer
-		: IDsa
-	{
-		private Gost3410KeyParameters key;
-		private SecureRandom random;
+    /**
+     * Gost R 34.10-94 Signature Algorithm
+     */
+    public class Gost3410Signer
+        : IDsa
+    {
+        private Gost3410KeyParameters key;
+        private SecureRandom random;
 
+        /// <inheritdoc/>
         public virtual string AlgorithmName
-		{
-			get { return "GOST3410"; }
-		}
+        {
+            get { return "GOST3410"; }
+        }
 
+        /// <inheritdoc/>
         public virtual void Init(bool forSigning, ICipherParameters parameters)
         {
             if (forSigning)
@@ -43,70 +45,86 @@ namespace Org.BouncyCastle.Crypto.Signers
             }
         }
 
+        /// <inheritdoc/>
         public virtual BigInteger Order
         {
             get { return key.Parameters.Q; }
         }
 
-		/**
-		 * generate a signature for the given message using the key we were
-		 * initialised with. For conventional Gost3410 the message should be a Gost3411
-		 * hash of the message of interest.
-		 *
-		 * @param message the message that will be verified later.
-		 */
+        /**
+         * generate a signature for the given message using the key we were
+         * initialised with. For conventional Gost3410 the message should be a Gost3411
+         * hash of the message of interest.
+         *
+         * @param message the message that will be verified later.
+         */
         public virtual BigInteger[] GenerateSignature(byte[] message)
-		{
-			BigInteger m = new BigInteger(1, message, bigEndian: false);
-			Gost3410Parameters parameters = key.Parameters;
-			BigInteger k;
+        {
+            Gost3410Parameters parameters = key.Parameters;
+            BigInteger m = CalculateM(parameters.Q, message);
+            BigInteger k;
 
-			do
-			{
-				k = new BigInteger(parameters.Q.BitLength, random);
-			}
-			while (k.CompareTo(parameters.Q) >= 0);
+            do
+            {
+                k = new BigInteger(parameters.Q.BitLength, random);
+            }
+            while (k.SignValue == 0 || k.CompareTo(parameters.Q) >= 0);
 
-			BigInteger r = parameters.A.ModPow(k, parameters.P).Mod(parameters.Q);
+            // k gives up x through s if it leaks, so the exponent is blinded with a random multiple of q before the
+            // variable-time ModPow; a has order q, so r is unchanged
+            BigInteger blindedK = BigIntegers.CreateBlindedExponent(k, parameters.Q, random);
+            BigInteger r = parameters.A.ModPow(blindedK, parameters.P).Mod(parameters.Q);
 
-			BigInteger s = k.Multiply(m).
-				Add(((Gost3410PrivateKeyParameters)key).X.Multiply(r)).
-				Mod(parameters.Q);
+            // keeping the secret x and nonce k off BigInteger.Mod, whose cost follows the quotient; x is in [1, q-1] by
+            // Gost3410PrivateKeyParameters, k is drawn below q, m and r are reduced, and q is prime and so odd
+            BigInteger q = parameters.Q;
+            BigInteger s = BigIntegers.ModAdd(q, BigIntegers.ModMult(q, k, m),
+                BigIntegers.ModMult(q, ((Gost3410PrivateKeyParameters)key).X, r));
 
-			return new BigInteger[]{ r, s };
-		}
+            return new BigInteger[]{ r, s };
+        }
 
-		/**
-		 * return true if the value r and s represent a Gost3410 signature for
-		 * the passed in message for standard Gost3410 the message should be a
-		 * Gost3411 hash of the real message to be verified.
-		 */
+        /**
+         * return true if the value r and s represent a Gost3410 signature for
+         * the passed in message for standard Gost3410 the message should be a
+         * Gost3411 hash of the real message to be verified.
+         */
         public virtual bool VerifySignature(byte[] message, BigInteger r, BigInteger s)
-		{
-            BigInteger m = new BigInteger(1, message, bigEndian: false);
-			Gost3410Parameters parameters = key.Parameters;
+        {
+            Gost3410Parameters parameters = key.Parameters;
+            BigInteger m = CalculateM(parameters.Q, message);
 
-			if (r.SignValue < 0 || parameters.Q.CompareTo(r) <= 0)
-			{
-				return false;
-			}
+            // r in the range [1,q-1]
+            if (r.SignValue <= 0 || parameters.Q.CompareTo(r) <= 0)
+            {
+                return false;
+            }
 
-			if (s.SignValue < 0 || parameters.Q.CompareTo(s) <= 0)
-			{
-				return false;
-			}
+            // s in the range [1,q-1]
+            if (s.SignValue <= 0 || parameters.Q.CompareTo(s) <= 0)
+            {
+                return false;
+            }
 
-			BigInteger v = m.ModPow(parameters.Q.Subtract(BigInteger.Two), parameters.Q);
+            BigInteger v = m.ModPow(parameters.Q.Subtract(BigInteger.Two), parameters.Q);
 
-			BigInteger z1 = s.Multiply(v).Mod(parameters.Q);
-			BigInteger z2 = (parameters.Q.Subtract(r)).Multiply(v).Mod(parameters.Q);
+            BigInteger z1 = s.Multiply(v).Mod(parameters.Q);
+            BigInteger z2 = (parameters.Q.Subtract(r)).Multiply(v).Mod(parameters.Q);
 
-			z1 = parameters.A.ModPow(z1, parameters.P);
-			z2 = ((Gost3410PublicKeyParameters)key).Y.ModPow(z2, parameters.P);
+            z1 = parameters.A.ModPow(z1, parameters.P);
+            z2 = ((Gost3410PublicKeyParameters)key).Y.ModPow(z2, parameters.P);
 
-			BigInteger u = z1.Multiply(z2).Mod(parameters.P).Mod(parameters.Q);
+            BigInteger u = z1.Multiply(z2).Mod(parameters.P).Mod(parameters.Q);
 
-			return u.Equals(r);
-		}
-	}
+            return u.Equals(r);
+        }
+
+        // GOST R 34.10-94, as RFC 5832 for 2001: m = H(M) mod q, and m = 0 becomes 1. Otherwise a signature over such a
+        // digest is s = x * r, giving up the private key as s * r^-1, and verification accepts r = 1 with any s.
+        private static BigInteger CalculateM(BigInteger q, byte[] message)
+        {
+            BigInteger m = new BigInteger(1, message, bigEndian: false).Mod(q);
+            return m.SignValue == 0 ? BigInteger.One : m;
+        }
+    }
 }

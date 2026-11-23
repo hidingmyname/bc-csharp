@@ -1,116 +1,188 @@
 using System;
-using System.Collections.Generic;
+using System.Diagnostics;
 
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Math;
+using Org.BouncyCastle.Math.Raw;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Engines
 {
-	/**
-	* NaccacheStern Engine. For details on this cipher, please see
-	* http://www.gemplus.com/smart/rd/publications/pdf/NS98pkcs.pdf
-	*/
-	public class NaccacheSternEngine
-		: IAsymmetricBlockCipher
-	{
-		private bool forEncryption;
+    /**
+    * NaccacheStern Engine. For details on this cipher, please see
+    * http://www.gemplus.com/smart/rd/publications/pdf/NS98pkcs.pdf
+    */
+    public class NaccacheSternEngine
+        : IAsymmetricBlockCipher
+    {
+        private bool forEncryption;
 
-		private NaccacheSternKeyParameters key;
+        private NaccacheSternKeyParameters key;
 
-		private IList<BigInteger>[] lookup = null;
+        // one fixed-length encoding per possible digit, per small prime, so the search in decryption can compare
+        // byte by byte without the length itself saying anything
+        private byte[][][] lookup = null;
 
-		public string AlgorithmName
-		{
-			get { return "NaccacheStern"; }
-		}
+        // Decryption raises the ciphertext to phi(n) / sigma, once per block, and that power to sigma / p for each
+        // small prime p. phi(n) / sigma is secret, worked out once when the tables are built rather than divided out
+        // again for every block, and no more sensitive than the tables themselves; the sigma / p are not secret.
+        private BigInteger phiNOverSigma = null;
+        private BigInteger[] sigmaOverPrime = null;
 
-		/**
-		* Initializes this algorithm. Must be called before all other Functions.
-		*
-		* @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#init(bool,
-		*      Org.BouncyCastle.Crypto.CipherParameters)
-		*/
-		public virtual void Init(bool forEncryption, ICipherParameters parameters)
-		{
-			this.forEncryption = forEncryption;
+        private int modulusLength;
 
-            parameters = ParameterUtilities.IgnoreRandom(parameters);
+        // CRT recombination data, derived only from the small primes: for each prime p_i, sigma / p_i (at the
+        // accumulator length) and its inverse mod p_i; and sigma * 2^j for the final reduction
+        private uint[][] crtCofactors;
+        private uint[] crtInverses;
+        private uint[][] crtSigmaMultiples;
 
-			key = (NaccacheSternKeyParameters)parameters;
+        private SecureRandom random;
 
-			// construct lookup table for faster decryption if necessary
-			if (!this.forEncryption)
-			{
-				NaccacheSternPrivateKeyParameters priv = (NaccacheSternPrivateKeyParameters)key;
-				var primes = priv.SmallPrimesList;
-				lookup = new IList<BigInteger>[primes.Count];
-				for (int i = 0; i < primes.Count; i++)
-				{
-					BigInteger actualPrime = primes[i];
-					int actualPrimeValue = actualPrime.IntValue;
+        /// <inheritdoc/>
+        public string AlgorithmName
+        {
+            get { return "NaccacheStern"; }
+        }
 
-					lookup[i] = new List<BigInteger>(actualPrimeValue);
-					lookup[i].Add(BigInteger.One);
+        /**
+        * Initializes this algorithm. Must be called before all other Functions.
+        *
+        * @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#init(bool,
+        *      Org.BouncyCastle.Crypto.CipherParameters)
+        */
+        public virtual void Init(bool forEncryption, ICipherParameters parameters)
+        {
+            this.forEncryption = forEncryption;
 
-					BigInteger accJ = BigInteger.Zero;
-					for (int j = 1; j < actualPrimeValue; j++)
-					{
-						accJ = accJ.Add(priv.PhiN);
-						BigInteger comp = accJ.Divide(actualPrime);
-						lookup[i].Add(priv.G.ModPow(comp, priv.Modulus));
-					}
-				}
-			}
-		}
+            parameters = ParameterUtilities.GetRandom(parameters, out var providedRandom);
 
-		/**
-		* Returns the input block size of this algorithm.
-		*
-		* @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#GetInputBlockSize()
-		*/
+            key = (NaccacheSternKeyParameters)parameters;
+
+            // construct lookup table for faster decryption if necessary
+            if (!this.forEncryption)
+            {
+                // building the tables blinds its exponents, and decryption the ciphertext
+                random = CryptoServicesRegistrar.GetSecureRandom(providedRandom);
+
+                NaccacheSternPrivateKeyParameters priv = (NaccacheSternPrivateKeyParameters)key;
+                modulusLength = (priv.Modulus.BitLength + 7) / 8;
+                var primes = priv.SmallPrimesList;
+
+                // sum_i d_i * (sigma / p_i) * ((sigma / p_i)^-1 mod p_i) is below count * sigma, so bitlength(count)
+                // masked subtractions of sigma * 2^j reduce it mod sigma; the accumulator is sized for that sum
+                BigInteger sigma = BigInteger.One;
+                for (int i = 0; i < primes.Count; i++)
+                {
+                    sigma = sigma.Multiply(primes[i]);
+                }
+
+                int reductions = Integers.BitLength(primes.Count);
+                int crtBits = sigma.BitLength + reductions;
+
+                sigmaOverPrime = new BigInteger[primes.Count];
+                crtCofactors = new uint[primes.Count][];
+                crtInverses = new uint[primes.Count];
+                for (int i = 0; i < primes.Count; i++)
+                {
+                    sigmaOverPrime[i] = ExactDivide(sigma, primes[i], sigma.BitLength);
+                    crtCofactors[i] = Nat.FromBigInteger(crtBits, sigmaOverPrime[i]);
+                    crtInverses[i] = (uint)sigmaOverPrime[i].ModInverse(primes[i]).IntValue;
+                }
+
+                crtSigmaMultiples = new uint[reductions][];
+                for (int j = 0; j < reductions; j++)
+                {
+                    crtSigmaMultiples[j] = Nat.FromBigInteger(crtBits, sigma.ShiftLeft(j));
+                }
+
+                // phi(n) / p_i = (phi(n) / sigma) * (sigma / p_i), so one exact division serves every prime. sigma
+                // divides phi(n), and the quotient is below 2^k for k the modulus bit length.
+                phiNOverSigma = ExactDivide(priv.PhiN, sigma, priv.Modulus.BitLength);
+
+                lookup = new byte[primes.Count][][];
+                for (int i = 0; i < primes.Count; i++)
+                {
+                    int actualPrimeValue = primes[i].IntValue;
+
+                    lookup[i] = new byte[actualPrimeValue][];
+                    lookup[i][0] = BigIntegers.AsUnsignedByteArray(modulusLength, BigInteger.One);
+
+                    // entry j is g^(j * phi(n) / p) = h^j for h = g^(phi(n) / p), so one exponentiation and then
+                    // repeated multiplication build the table. The exponent carries phi(n), the private key, so it is
+                    // blinded with a random multiple of phi(n) before the variable-time ModPow; g is coprime to n, so h
+                    // is unchanged. The entries are as sensitive as the key (h - 1 shares a prime factor with n), so
+                    // the chain uses the fixed-time ModMult rather than ModMultiply, whose reduction follows the value.
+                    // If p divides both P - 1 and Q - 1 for n = PQ (always so for p = 2), then h = 1 for every g,
+                    // every entry is 1, and that digit always decrypts as 0; the key is invalid but this does not
+                    // detect it.
+                    // TODO As decryption does, compute g^(phi(n) / sigma) once and raise it to sigma / p for each
+                    // prime: one full-size exponentiation rather than one per prime. Those powers would have a
+                    // secret base, so this wants a constant-time exponentiation first.
+                    BigInteger exponent = BigIntegers.CreateBlindedExponent(
+                        phiNOverSigma.Multiply(sigmaOverPrime[i]), priv.PhiN, random);
+                    BigInteger h = priv.G.ModPow(exponent, priv.Modulus);
+                    BigInteger entry = BigInteger.One;
+                    for (int j = 1; j < actualPrimeValue; j++)
+                    {
+                        entry = BigIntegers.ModMult(priv.Modulus, entry, h);
+                        lookup[i][j] = BigIntegers.AsUnsignedByteArray(modulusLength, entry);
+                    }
+                }
+            }
+            else
+            {
+                random = null;
+            }
+        }
+
+        /**
+        * Returns the input block size of this algorithm.
+        *
+        * @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#GetInputBlockSize()
+        */
         public virtual int GetInputBlockSize()
-		{
-			if (forEncryption)
-			{
-				// We can only encrypt values up to lowerSigmaBound
-				return (key.LowerSigmaBound + 7) / 8 - 1;
-			}
-			else
-			{
-				// We pad to modulus-size bytes for easier decryption.
-//				return key.Modulus.ToByteArray().Length;
-				return key.Modulus.BitLength / 8 + 1;
-			}
-		}
+        {
+            if (forEncryption)
+            {
+                // We can only encrypt values up to lowerSigmaBound
+                return (key.LowerSigmaBound + 7) / 8 - 1;
+            }
+            else
+            {
+                // We pad to modulus-size bytes for easier decryption.
+// return key.Modulus.ToByteArray().Length;
+                return key.Modulus.BitLength / 8 + 1;
+            }
+        }
 
-		/**
-		* Returns the output block size of this algorithm.
-		*
-		* @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#GetOutputBlockSize()
-		*/
+        /**
+        * Returns the output block size of this algorithm.
+        *
+        * @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#GetOutputBlockSize()
+        */
         public virtual int GetOutputBlockSize()
-		{
-			if (forEncryption)
-			{
-				// encrypted Data is always padded up to modulus size
-//				return key.Modulus.ToByteArray().Length;
-				return key.Modulus.BitLength / 8 + 1;
-			}
-			else
-			{
-				// decrypted Data has upper limit lowerSigmaBound
-				return (key.LowerSigmaBound + 7) / 8 - 1;
-			}
-		}
+        {
+            if (forEncryption)
+            {
+                // encrypted Data is always padded up to modulus size
+// return key.Modulus.ToByteArray().Length;
+                return key.Modulus.BitLength / 8 + 1;
+            }
+            else
+            {
+                // decrypted Data has upper limit lowerSigmaBound
+                return (key.LowerSigmaBound + 7) / 8 - 1;
+            }
+        }
 
-		/**
-		* Process a single Block using the Naccache-Stern algorithm.
-		*
-		* @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#ProcessBlock(byte[],
-		*      int, int)
-		*/
+        /**
+        * Process a single Block using the Naccache-Stern algorithm.
+        *
+        * @see Org.BouncyCastle.Crypto.AsymmetricBlockCipher#ProcessBlock(byte[],
+        *      int, int)
+        */
         public virtual byte[] ProcessBlock(byte[] inBytes, int inOff, int length)
         {
             if (key == null)
@@ -134,78 +206,111 @@ namespace Org.BouncyCastle.Crypto.Engines
             if (forEncryption)
                 return Encrypt(input);
 
-            var plain = new List<BigInteger>();
             NaccacheSternPrivateKeyParameters priv = (NaccacheSternPrivateKeyParameters)key;
             var primes = priv.SmallPrimesList;
-            // Get Chinese Remainders of CipherText
-            for (int i = 0; i < primes.Count; i++)
+            BigInteger modulus = priv.Modulus;
+
+            // The digit for each small prime p comes from input^(phi(n) / p) = (input^(phi(n) / sigma))^(sigma / p), so
+            // the secret exponent phi(n) / sigma is used once per block and the exponents per prime are not secret.
+            // input is the caller's ciphertext and phi(n) / sigma is as good as the private key, so the base is blinded
+            // for that exponentiation: the timing of the variable-time ModPow could otherwise be accumulated against
+            // the key over many decryptions. An input that is zero mod n has no digits, and one sharing a factor with n
+            // fails the lookup below, as it always did.
+            input = input.Mod(modulus);
+            if (input.SignValue == 0)
+                throw new InvalidCipherTextException("Lookup failed");
+
+            BigInteger power = BigIntegers.ModPowBaseBlinded(modulus, input, phiNOverSigma, random);
+
+            // The plaintext is recombined from its digits d_i = plaintext mod p_i by the CRT, in a fixed-length
+            // accumulator so that neither the digits nor the sum steer the work (BigInteger arithmetic shortcuts zero
+            // operands, sizes products by their values, and reduces by shift-and-subtract over the quotient).
+            int crtLength = crtCofactors[0].Length;
+            uint[] acc = Nat.Create(crtLength);
+            uint[] tmp = Nat.Create(crtLength);
+            try
             {
-                BigInteger exp = input.ModPow(priv.PhiN.Divide(primes[i]), priv.Modulus);
-                var al = lookup[i];
-                if (lookup[i].Count != primes[i].IntValue)
+                for (int i = 0; i < primes.Count; i++)
                 {
-                    throw new InvalidCipherTextException("Error in lookup Array for "
-                                    + primes[i].IntValue
-                                    + ": Size mismatch. Expected ArrayList with length "
-                                    + primes[i].IntValue + " but found ArrayList of length "
-                                    + lookup[i].Count);
+                    // the base here is a function of the plaintext only (g^(m * phi(n) / sigma) for plaintext m), so
+                    // the variable-time ModPow can at most tell something of the plaintext, nothing of the key
+                    BigInteger exp = power.ModPow(sigmaOverPrime[i], modulus);
+                    byte[][] al = lookup[i];
+                    if (al.Length != primes[i].IntValue)
+                    {
+                        throw new InvalidCipherTextException("Error in lookup Array for "
+                                        + primes[i].IntValue
+                                        + ": Size mismatch. Expected ArrayList with length "
+                                        + primes[i].IntValue + " but found ArrayList of length "
+                                        + al.Length);
+                    }
+
+                    // the CRT term d_i * (sigma / p_i) * ((sigma / p_i)^-1 mod p_i) mod sigma is (sigma / p_i) * t_i
+                    // for t_i = d_i * (sigma / p_i)^-1 mod p_i, and the lookup yields t_i directly, so each term is
+                    // below sigma and needs no reduction of its own
+                    if (!FixedTimeLookup(al, BigIntegers.AsUnsignedByteArray(modulusLength, exp), crtInverses[i],
+                        out uint t))
+                    {
+                        throw new InvalidCipherTextException("Lookup failed");
+                    }
+
+                    Nat.MulWordAddTo(crtLength, t, crtCofactors[i], 0, acc, 0);
                 }
-                int lookedup = al.IndexOf(exp);
 
-                if (lookedup == -1)
-                    throw new InvalidCipherTextException("Lookup failed");
+                // acc < count * sigma <= 2^reductions * sigma, and each masked subtraction of sigma * 2^j halves the
+                // bound, leaving acc < sigma
+                for (int j = crtSigmaMultiples.Length - 1; j >= 0; --j)
+                {
+                    int borrow = Nat.Sub(crtLength, acc, crtSigmaMultiples[j], tmp);
+                    Nat.CMov(crtLength, ~borrow, tmp, 0, acc, 0);
+                }
 
-                plain.Add(BigInteger.ValueOf(lookedup));
+                // No check that g^test re-encrypts to the input: a valid ciphertext need not equal g^test, since
+                // probabilistic encryption multiplies in x^sigma and AddCryptedBlocks can leave a sum beyond sigma
+                // TODO[api] Encode the plaintext straight from acc, without the BigInteger round trip, and unsigned as
+                // the RSA and ElGamal engines do: the signed ToByteArray adds a 0x00 when the top bit is set (the value
+                // is never negative), which can take the output past GetOutputBlockSize(). ProcessData concatenates
+                // these value-length blocks, so decrypting there also loses any block's leading zero bytes.
+                BigInteger test = Nat.ToBigInteger(crtLength, acc);
+                return test.ToByteArray();
             }
-            BigInteger test = ChineseRemainder(plain, primes);
-
-            // Should not be used as an oracle, so reencrypt output to see
-            // if it corresponds to input
-
-            // this breaks probabilisic encryption, so disable it. Anyway, we do
-            // use the first n primes for key generation, so it is pretty easy
-            // to guess them. But as stated in the paper, this is not a security
-            // breach. So we can just work with the correct sigma.
-
-            // if ((key.G.ModPow(test, key.Modulus)).Equals(input)) {
-            //      output = test.ToByteArray();
-            // } else {
-            //      output = null;
-            // }
-
-            return test.ToByteArray();
+            finally
+            {
+                Arrays.ZeroMemory(acc);
+                Arrays.ZeroMemory(tmp);
+            }
         }
 
         /**
-		* Encrypts a BigInteger aka Plaintext with the public key.
-		*
-		* @param plain
-		*            The BigInteger to encrypt
-		* @return The byte[] representation of the encrypted BigInteger (i.e.
-		*         crypted.toByteArray())
-		*/
+        * Encrypts a BigInteger aka Plaintext with the public key.
+        *
+        * @param plain
+        *            The BigInteger to encrypt
+        * @return The byte[] representation of the encrypted BigInteger (i.e.
+        *         crypted.toByteArray())
+        */
         public virtual byte[] Encrypt(BigInteger plain)
         {
-			// Always return modulus size values 0-padded at the beginning
-			// 0-padding at the beginning is correctly parsed by BigInteger :)
+            // Always return modulus size values 0-padded at the beginning
+            // 0-padding at the beginning is correctly parsed by BigInteger :)
 
-			return BigIntegers.AsUnsignedByteArray(key.Modulus.BitLength / 8 + 1, key.G.ModPow(plain, key.Modulus));
+            return BigIntegers.AsUnsignedByteArray(key.Modulus.BitLength / 8 + 1, key.G.ModPow(plain, key.Modulus));
         }
 
-		/**
-		* Adds the contents of two encrypted blocks mod sigma
-		*
-		* @param block1
-		*            the first encrypted block
-		* @param block2
-		*            the second encrypted block
-		* @return encrypt((block1 + block2) mod sigma)
-		* @throws InvalidCipherTextException
-		*/
+        /**
+        * Adds the contents of two encrypted blocks mod sigma
+        *
+        * @param block1
+        *            the first encrypted block
+        * @param block2
+        *            the second encrypted block
+        * @return encrypt((block1 + block2) mod sigma)
+        * @throws InvalidCipherTextException
+        */
         public virtual byte[] AddCryptedBlocks(byte[] block1, byte[] block2)
         {
-			// check for correct blocksize
-			int blockSize = forEncryption ? GetOutputBlockSize() : GetInputBlockSize();
+            // check for correct blocksize
+            int blockSize = forEncryption ? GetOutputBlockSize() : GetInputBlockSize();
 
             if (block1.Length > blockSize || block2.Length > blockSize)
                 throw new InvalidCipherTextException("BlockLength too large for simple addition.\n");
@@ -218,84 +323,105 @@ namespace Org.BouncyCastle.Crypto.Engines
             return BigIntegers.AsUnsignedByteArray(key.Modulus.BitLength / 8 + 1, m1m2Crypt);
         }
 
-		/**
-		* Convenience Method for data exchange with the cipher.
-		*
-		* Determines blocksize and splits data to blocksize.
-		*
-		* @param data the data to be processed
-		* @return the data after it went through the NaccacheSternEngine.
-		* @throws InvalidCipherTextException
-		*/
+        /**
+        * Convenience Method for data exchange with the cipher.
+        *
+        * Determines blocksize and splits data to blocksize.
+        *
+        * @param data the data to be processed
+        * @return the data after it went through the NaccacheSternEngine.
+        * @throws InvalidCipherTextException
+        */
         public virtual byte[] ProcessData(byte[] data)
-		{
+        {
             int inBlockSize = GetInputBlockSize();
 
-			if (data.Length <= inBlockSize)
+            if (data.Length <= inBlockSize)
                 return ProcessBlock(data, 0, data.Length);
 
-			int outBlockSize = GetOutputBlockSize();
-			int datapos = 0;
-			int retpos = 0;
-			byte[] retval = new byte[(data.Length / inBlockSize + 1) * outBlockSize];
-			while (datapos < data.Length)
-			{
-				byte[] tmp;
-				if (datapos + inBlockSize < data.Length)
-				{
-					tmp = ProcessBlock(data, datapos, inBlockSize);
-					datapos += inBlockSize;
-				}
-				else
-				{
-					tmp = ProcessBlock(data, datapos, data.Length - datapos);
-					datapos += data.Length - datapos;
-				}
+            int outBlockSize = GetOutputBlockSize();
+            int datapos = 0;
+            int retpos = 0;
+            byte[] retval = new byte[(data.Length / inBlockSize + 1) * outBlockSize];
+            while (datapos < data.Length)
+            {
+                byte[] tmp;
+                if (datapos + inBlockSize < data.Length)
+                {
+                    tmp = ProcessBlock(data, datapos, inBlockSize);
+                    datapos += inBlockSize;
+                }
+                else
+                {
+                    tmp = ProcessBlock(data, datapos, data.Length - datapos);
+                    datapos += data.Length - datapos;
+                }
 
-				if (tmp == null)
+                if (tmp == null)
                     throw new InvalidCipherTextException("cipher returned null");
 
                 tmp.CopyTo(retval, retpos);
-				retpos += tmp.Length;
-			}
+                retpos += tmp.Length;
+            }
 
-			if (retpos != retval.Length)
-			{
-				retval = Arrays.CopyOf(retval, retpos);
-			}
+            if (retpos != retval.Length)
+            {
+                retval = Arrays.CopyOf(retval, retpos);
+            }
 
-			return retval;
-		}
+            return retval;
+        }
 
-		/**
-		* Computes the integer x that is expressed through the given primes and the
-		* congruences with the chinese remainder theorem (CRT).
-		*
-		* @param congruences
-		*            the congruences c_i
-		* @param primes
-		*            the primes p_i
-		* @return an integer x for that x % p_i == c_i
-		*/
-		private static BigInteger ChineseRemainder(IList<BigInteger> congruences, IList<BigInteger> primes)
-		{
-			BigInteger retval = BigInteger.Zero;
-			BigInteger all = BigInteger.One;
-			for (int i = 0; i < primes.Count; i++)
-			{
-				all = all.Multiply(primes[i]);
-			}
-			for (int i = 0; i < primes.Count; i++)
-			{
-				BigInteger a = primes[i];
-				BigInteger b = all.Divide(a);
-				BigInteger b2 = b.ModInverse(a);
-				BigInteger tmp = b.Multiply(b2);
-				tmp = tmp.Multiply(congruences[i]);
-				retval = retval.Add(tmp);
-			}
+        // x / d for odd d dividing x, with the quotient below 2^bits, without BigInteger.Divide, whose
+        // shift-and-subtract loop follows the bits of the quotient: it is x * d^-1 mod 2^bits, one multiplication and a
+        // mask. Only correct when d divides x, hence kept local to this engine.
+        // TODO Consider word-level exact division (one pass using d^-1 mod 2^32) instead of the full multiply; currently
+        // negligible next to the ModPow each result feeds.
+        private static BigInteger ExactDivide(BigInteger x, BigInteger d, int bits)
+        {
+            BigInteger m = BigInteger.One.ShiftLeft(bits);
+            BigInteger q = x.Multiply(d.ModInverse(m)).Mod(m);
 
-			return retval.Mod(all);
-		}
-	}
+            Debug.Assert(q.Multiply(d).Equals(x));
+
+            return q;
+        }
+
+        // The index of the match is the plaintext digit d for this prime (the table length p), so returning as soon as
+        // it is found (as List.IndexOf did) made the running time reveal it. Scan the whole table and select by mask.
+        // The CRT needs d only as d * inv mod p, so that is what is selected, from a running j * inv mod p.
+        private static bool FixedTimeLookup(byte[][] table, byte[] value, uint inv, out uint digitTimesInv)
+        {
+            uint p = (uint)table.Length;
+            Debug.Assert(p <= int.MaxValue && inv < p);
+
+            int found = 0;                                  // -1 once something has matched
+            uint r = 0;                                     // j * inv mod p
+            uint result = 0;
+
+            for (int j = 0; j < table.Length; ++j)
+            {
+                byte[] candidate = table[j];
+                int diff = 0;
+
+                for (int k = 0; k < value.Length; ++k)
+                {
+                    diff |= candidate[k] ^ value[k];
+                }
+
+                int isEqual = (diff - 1) >> 31;             // -1 when equal, 0 otherwise
+
+                result |= r & (uint)(isEqual & ~found);
+                found |= isEqual;
+
+                // r + inv < 2p, and with p below 2^31 the difference r + inv - p is in (-2^31, 2^31)
+                uint s = r + inv;
+                uint below = (uint)((int)(s - p) >> 31);    // all ones when s < p
+                r = s - (p & ~below);
+            }
+
+            digitTimesInv = result;
+            return found != 0;
+        }
+    }
 }

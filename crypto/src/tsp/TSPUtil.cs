@@ -19,11 +19,13 @@ using Org.BouncyCastle.X509.Extension;
 
 namespace Org.BouncyCastle.Tsp
 {
+    /// <summary>The resolution to which the generation time of a time-stamp token is rounded down.</summary>
     public enum Resolution
     {
         R_SECONDS, R_TENTHS_OF_SECONDS, R_HUNDREDTHS_OF_SECONDS, R_MILLISECONDS
     }
 
+    /// <summary>Utility methods for the time stamp protocol.</summary>
     public class TspUtil
     {
         // TODO Migrate this information to DigestUtilities
@@ -131,7 +133,7 @@ namespace Org.BouncyCastle.Tsp
             if (eku == null)
                 throw new TspValidationException("Certificate must have an ExtendedKeyUsage extension.");
 
-            if (!cert.GetCriticalExtensionOids().Contains(X509Extensions.ExtendedKeyUsage.Id))
+            if (!cert.GetExtension(X509Extensions.ExtendedKeyUsage).IsCritical)
                 throw new TspValidationException("Certificate must have an ExtendedKeyUsage extension marked as critical.");
 
             if (!eku.HasKeyPurposeId(KeyPurposeID.id_kp_timeStamping) || eku.Count != 1)

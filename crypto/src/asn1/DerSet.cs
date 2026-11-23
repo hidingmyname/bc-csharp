@@ -6,85 +6,131 @@ using Org.BouncyCastle.Utilities.Collections;
 
 namespace Org.BouncyCastle.Asn1
 {
+    /// <summary>ASN.1 SET with DER encoding; the elements are sorted.</summary>
     public class DerSet
         : Asn1Set
     {
+        /// <summary>The empty <see cref="DerSet"/>.</summary>
         public static readonly DerSet Empty = new DerSet();
 
+        /// <summary>Create a <see cref="DerSet"/> from a collection of elements.</summary>
+        /// <param name="elements">The elements.</param>
+        /// <returns>The new <see cref="DerSet"/>.</returns>
         public static DerSet FromCollection(IReadOnlyCollection<Asn1Encodable> elements)
         {
             return elements.Count < 1 ? Empty : new DerSet(elements);
         }
 
+        /// <summary>Create a <see cref="DerSet"/> holding a single element.</summary>
+        /// <param name="element">The element.</param>
+        /// <returns>The new <see cref="DerSet"/>.</returns>
         public static DerSet FromElement(Asn1Encodable element) => new DerSet(element);
 
+        /// <summary>Create a <see cref="DerSet"/> from the elements of a vector.</summary>
+        /// <param name="elementVector">The vector of elements.</param>
+        /// <returns>The new <see cref="DerSet"/>.</returns>
         public static DerSet FromVector(Asn1EncodableVector elementVector)
         {
             return elementVector.Count < 1 ? Empty : new DerSet(elementVector);
         }
 
+        /// <summary>Create a <see cref="DerSet"/> by applying a function to each element of the source.</summary>
+        /// <param name="ts">The source array.</param>
+        /// <param name="func">The function to apply to each element.</param>
+        /// <returns>The new <see cref="DerSet"/>.</returns>
         public static DerSet Map<T>(T[] ts, Func<T, Asn1Encodable> func)
         {
-            return ts.Length < 1 ? Empty : new DerSet(CollectionUtilities.Map(ts, func));
+            return ts.Length < 1 ? Empty : WithElementsUnshared(CollectionUtilities.Map(ts, func));
         }
 
+        /// <summary>Create a <see cref="DerSet"/> by applying a function to each element of the source.</summary>
+        /// <param name="c">The source collection.</param>
+        /// <param name="func">The function to apply to each element.</param>
+        /// <returns>The new <see cref="DerSet"/>.</returns>
         public static DerSet Map<T>(IReadOnlyCollection<T> c, Func<T, Asn1Encodable> func)
         {
-            return c.Count < 1 ? Empty : new DerSet(CollectionUtilities.Map(c, func));
+            return c.Count < 1 ? Empty : WithElementsUnshared(CollectionUtilities.Map(c, func));
         }
 
+        /// <summary>Create a DER set that uses <paramref name="elements"/> directly, without copying.</summary>
+        /// <remarks>
+        /// The array is sorted in place, so it must not be shared: the caller gives up the array, which must not
+        /// also be another object's backing array (e.g. a sequence's elements).
+        /// </remarks>
+        internal static DerSet WithElementsUnshared(Asn1Encodable[] elements)
+        {
+            if (elements.Length < 1)
+                return Empty;
+
+            var sortedDerEncodings = elements.Length > 1 ? SortElements(elements) : null;
+            return new DerSet(elements, sortedDerEncodings);
+        }
+
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
         public DerSet()
             : base()
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="element">The element.</param>
         public DerSet(Asn1Encodable element)
             : base(element)
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="elements">The elements.</param>
         public DerSet(params Asn1Encodable[] elements)
             : base(elements, doSort: true)
         {
         }
 
-        internal DerSet(Asn1Encodable[] elements, bool doSort)
+        private protected DerSet(Asn1Encodable[] elements, bool doSort)
             : base(elements, doSort)
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="elementVector">The element vector.</param>
         public DerSet(Asn1EncodableVector elementVector)
             : base(elementVector, doSort: true)
         {
         }
 
-        internal DerSet(Asn1EncodableVector elementVector, bool doSort)
+        private protected DerSet(Asn1EncodableVector elementVector, bool doSort)
             : base(elementVector, doSort)
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="elements">The elements.</param>
         public DerSet(IReadOnlyCollection<Asn1Encodable> elements)
             : base(elements, doSort: true)
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="sequence">The sequence.</param>
         public DerSet(Asn1Sequence sequence)
             : base(element: sequence)
         {
         }
 
+        /// <summary>Create a new <see cref="DerSet"/>.</summary>
+        /// <param name="asn1Set">The asn 1 set.</param>
         public DerSet(Asn1Set asn1Set)
             : base(element: asn1Set)
         {
         }
 
-        internal DerSet(IReadOnlyCollection<Asn1Encodable> elements, bool doSort)
+        private protected DerSet(IReadOnlyCollection<Asn1Encodable> elements, bool doSort)
             : base(elements, doSort)
         {
         }
 
-        internal DerSet(bool isSorted, Asn1Encodable[] elements)
-            : base(isSorted, elements)
+        private protected DerSet(Asn1Encodable[] elements, DerEncoding[] sortedDerEncodings)
+            : base(elements, sortedDerEncodings)
         {
         }
 
