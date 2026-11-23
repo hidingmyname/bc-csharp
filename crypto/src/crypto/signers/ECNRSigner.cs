@@ -6,6 +6,7 @@ using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Math;
 using Org.BouncyCastle.Math.EC;
 using Org.BouncyCastle.Security;
+using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Signers
 {
@@ -15,15 +16,17 @@ namespace Org.BouncyCastle.Crypto.Signers
     public class ECNRSigner
         : IDsa
     {
-        private bool			forSigning;
-        private ECKeyParameters	key;
-        private SecureRandom	random;
+        private bool forSigning;
+        private ECKeyParameters key;
+        private SecureRandom random;
 
+        /// <inheritdoc/>
         public virtual string AlgorithmName
         {
             get { return "ECNR"; }
         }
 
+        /// <inheritdoc/>
         public virtual void Init(bool forSigning, ICipherParameters parameters)
         {
             this.forSigning = forSigning;
@@ -48,6 +51,7 @@ namespace Org.BouncyCastle.Crypto.Signers
             }
         }
 
+        /// <inheritdoc/>
         public virtual BigInteger Order
         {
             get { return key.Parameters.N; }
@@ -110,7 +114,9 @@ namespace Org.BouncyCastle.Crypto.Signers
             // generate s
             BigInteger x = privKey.D;                // private key value
             BigInteger u = ((ECPrivateKeyParameters) tempPair.Private).D; // temp's private key value
-            s = u.Subtract(r.Multiply(x)).Mod(n);
+            // keeping the secret x and ephemeral u off BigInteger.Mod, whose cost follows the quotient; both are in
+            // [1, n-1] by ValidatePrivateScalar, and r is reduced
+            s = BigIntegers.ModSubtract(n, u, BigIntegers.ModMult(n, r, x));
 
             return new BigInteger[]{ r, s };
         }
@@ -130,9 +136,9 @@ namespace Org.BouncyCastle.Crypto.Signers
          * @exception DataLengthException if the digest is longer than the key allows
          */
         public virtual bool VerifySignature(
-            byte[]		message,
-            BigInteger	r,
-            BigInteger	s)
+            byte[] message,
+            BigInteger r,
+            BigInteger s)
         {
             if (this.forSigning)
             {

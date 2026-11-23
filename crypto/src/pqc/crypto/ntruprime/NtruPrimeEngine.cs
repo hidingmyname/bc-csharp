@@ -1,5 +1,7 @@
 using System;
-using System.Collections.Generic;
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+using System.Runtime.InteropServices;
+#endif
 
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Digests;
@@ -21,14 +23,14 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
         private readonly int _secretKeyBytes; // C Reference: SecretKey_bytes
         private readonly int _publicKeyBytes; // C Reference: PublicKey_bytes
         private readonly int _ciphertextsBytes; // C Reference: Ciphertext_bytes
-        
+
         private readonly int _confirmBytes;
         private readonly int _inputsBytes; // For encoding _I-bit inputs
         private readonly int _topBytes;
         private readonly int _seedBytes;
         private readonly int _smallBytes;
         private readonly int _hashBytes;
-        
+
         private readonly int SessionKeyBytes;
 
         // Parameters for NTRU
@@ -37,7 +39,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
         private readonly int _roundedBytes; // Defined in params.h
 
-        // private readonly int _rqBytes; // Defined in params.h - Public key bytes for streamlined nTRU
+        private readonly int _rqBytes; // Defined in params.h - Public key bytes for streamlined nTRU
         private readonly bool _lpr;
         private readonly int _w;
         private readonly int _tau0;
@@ -48,6 +50,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
         private readonly int _I;
 
         private readonly int _q12;
+        private readonly int _qBarrett;
 
         public int PrivateKeySize => _skBytes;
         public int PublicKeySize => _pkBytes;
@@ -67,6 +70,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
             // KEM parameters
             this._roundedBytes = roundedBytes;
+            this._rqBytes = rqBytes;
             this._skBytes = skBytes;
             this._pkBytes = pkBytes;
             this._ctBytes = ctBytes;
@@ -78,6 +82,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
             _smallBytes = ((p + 3) / 4);
             _q12 = ((q - 1) / 2);
+            _qBarrett = NtruPrimeUtilities.GetBarrettFactor(q);
             _hashBytes = 32;
 
             if (lpr)
@@ -119,12 +124,12 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             {
                 inputs = new sbyte[_p];
             }
-            
+
             byte[] r_enc = new byte[_inputsBytes];
             byte[] cache = new byte[_hashBytes];
-            
+
             HashPrefix(cache, 4, pk, _publicKeyBytes);
-            
+
             if (_lpr)
             {
                 InputsRandom(inputs, random);
@@ -133,7 +138,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             {
                 ShortRandom(inputs, random);
             }
-            
+
             Hide(ct, r_enc, inputs, pk, cache);
             HashSession(ss, 1, r_enc, ct);
         }
@@ -187,7 +192,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             HashSession(ss, 1 + mask, r_enc, ct);
         }
 
-        // ---------------------------------------------------------------------    
+        // ---------------------------------------------------------------------
 
         private void KeyGen(SecureRandom random, byte[] pk, byte[] sk) // ZKeyGen
         {
@@ -206,7 +211,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 // BEGIN: XKeyGen > KeyGen
                 ShortRandom(a, random);
                 short[] aG = new short[_p];
-                RqMult(ref aG,  genOut, ref a);
+                NtruPrimeUtilities.RqMult(aG, genOut, a, _p, _q);
                 Round(A, aG);
                 // END XKeyGen > KeyGen
                 // END: XKeyGen
@@ -232,11 +237,11 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 {
                     ByteRandom(g, random);
                 }
-                while (R3Recip(ginv, g) != 0);
+                while (NtruPrimeUtilities.R3Recip(ginv, g, _p) != 0);
 
                 ShortRandom(f, random);
-                RqRecip3(finv, f);
-                RqMult(ref h, finv, g);
+                NtruPrimeUtilities.RqRecip3(finv, f, _p, _q);
+                NtruPrimeUtilities.RqMult(h, finv, g, _p, _q);
                 // END KeyGen
 
                 RqEncode(pk, h);
@@ -252,275 +257,58 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
         //----------------------- Streamlined --------------------------------
 
+        // Small_random
         private void ByteRandom(sbyte[] output, SecureRandom random)
         {
-            byte[] smallRandom = new byte[4];
-            for (int i = 0;i < _p;++i)
+            uint[] L = RandomUInt32s(random);
+            for (int i = 0; i < _p; ++i)
             {
-                random.NextBytes(smallRandom);
-                output[i] = (sbyte)((((BitConverter.ToUInt32(smallRandom, 0) & 0x3fffffff) * 3) >> 30)-1);
-            };
+                output[i] = (sbyte)((((L[i] & 0x3fffffff) * 3) >> 30) - 1);
+            }
         }
 
-        private int R3Recip(sbyte[] output, sbyte[] input)
+        // p uniform random uint32s, decoded little-endian. The reference draws each by its own 4-byte call
+        // (urandom32), so with a deterministic generator such as the KATs' its bytes differ from this single call's;
+        // the KAT test splits this request to match.
+        private uint[] RandomUInt32s(SecureRandom random)
         {
-            sbyte[] f = new sbyte[_p + 1];
-            sbyte[] g = new sbyte[_p + 1];
-            sbyte[] v = new sbyte[_p + 1];
-            sbyte[] r = new sbyte[_p + 1];
-
-            for (int i = 0; i <= _p; ++i)
+            uint[] L = new uint[_p];
+#if NETCOREAPP2_1_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            if (BitConverter.IsLittleEndian)
             {
-                v[i] = 0;
-                r[i] = 0;
+                random.NextBytes(MemoryMarshal.AsBytes(L.AsSpan()));
+                return L;
             }
-
-            r[0] = 1;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                f[i] = 0;
-            }
-            
-            f[0] = 1;
-            f[_p - 1] = f[_p] = -1;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                g[_p - 1 - i] = input[i];
-            }
-
-            g[_p] = 0;
-
-            int delta = 1;
-
-            int sign, swap, t;
-
-            for (int i = 0; i < 2*_p-1; ++i)
-            {
-                for (int j = _p; j > 0; --j)
-                {
-                    v[j] = v[j - 1];
-                }
-
-                v[0] = 0;
-
-                sign = -g[0] * f[0];
-
-                swap = NegativeMask((short)-delta) & ((g[0] != 0) ? -1 : 0);
-
-                delta ^= swap & (delta ^ -delta);
-                delta +=1;
-
-                for (int j = 0; j < _p + 1; ++j)
-                {
-                    t = swap&(f[j]^g[j]);
-                    f[j] ^= (sbyte)t; 
-                    g[j] ^= (sbyte)t;
-                    t = swap&(v[j]^r[j]); 
-                    v[j] ^= (sbyte)t; 
-                    r[j] ^= (sbyte)t;
-
-                }
-                for (int j = 0; j < _p+1; ++j)
-                {
-                    g[j] =(sbyte)(Mod(((g[j] + sign * f[j]) + 1), 3) - 1);
-                }
-
-                for (int j = 0; j < _p+1; ++j)
-                {
-                    r[j] =(sbyte)(Mod(((r[j] + sign * v[j]) + 1), 3) - 1);
-                }
-
-                for (int j = 0; j < _p; ++j)
-                {
-                    g[j] = g[j + 1];
-                }
-                g[_p] = 0;
-            }
-
-            sign = f[0];
-
-            for (int i = 0; i < _p; ++i)
-            {
-                output[i] = (sbyte)(sign * v[_p - 1 - i]);
-            }
-
-            return (delta != 0) ? -1 : 0;
-        }
-
-        private int RqRecip3(short[] output, sbyte[] input)
-        {
-            short[] f = new short[_p + 1];
-            short[] g = new short[_p + 1];
-            short[] v = new short[_p + 1];
-            short[] r = new short[_p + 1];
-            int swap, t;
-            short scale;
-            int f0, g0;
-
-            for (int i = 0; i < _p + 1; ++i)
-            {
-                v[i] = 0;
-                r[i] = 0;
-            }
-
-            r[0] = FqRecip(3);
-
-            for (int i = 0; i < _p; ++i)
-            {
-                f[i] = 0;
-            }
-
-            f[0] = 1;
-            f[_p - 1] = f[_p] = -1;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                g[_p - 1 - i] = input[i];
-            }
-
-            g[_p] = 0;
-
-            int delta = 1;
-
-            for (int i = 0; i < 2 * _p - 1; ++i)
-            {
-                for (int j = _p; j > 0; --j)
-                {
-                    v[j] = v[j - 1];
-                }
-
-                v[0] = 0;
-
-                swap = NegativeMask((short)-delta) & ((g[0] != 0) ? -1 : 0);
-
-                delta ^= swap & (delta ^ -delta);
-                delta += 1;
-
-                for (int j = 0; j < _p + 1; ++j)
-                {
-                    t = swap & (f[j] ^ g[j]);
-                    f[j] ^= (short)t;
-                    g[j] ^= (short)t;
-                    t = swap & (v[j] ^ r[j]);
-                    v[j] ^= (short)t;
-                    r[j] ^= (short)t;
-                }
-
-                f0 = f[0];
-                g0 = g[0];
-
-                for (int j = 0; j < _p + 1; ++j)
-                {
-                    g[j] = ArithmeticMod_q(f0 * g[j] - g0 * f[j]);
-                }
-
-                for (int j = 0; j < _p + 1; ++j)
-                {
-                    r[j] = ArithmeticMod_q(f0 * r[j] - g0 * v[j]);
-                }
-
-                for (int j = 0; j < _p; ++j)
-                {
-                    g[j] = g[j + 1];
-                }
-
-                g[_p] = 0;
-            }
-
-            scale = FqRecip(f[0]);
-
-            for (int i = 0; i < _p; ++i)
-            {
-                output[i] = ArithmeticMod_q(scale * v[_p - 1 - i]);
-            }
-
-            return (delta != 0) ? -1 : 0;
-        }
-
-        private short FqRecip(short a1)
-        {
-            int i = 1;
-            short ai = a1;
-
-            while (i < _q - 2)
-            {
-                ai = ArithmeticMod_q(a1 * ai);
-                i++;
-            }
-
-            return ai;
-        }
-
-        private void RqMult(ref short[] output, short[] f, sbyte[] g)
-        {
-            // h = f * g in the ring Rq
-
-            short[] fg = new short[_p + _p + 1]; // Can directly modify h
-            short result;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                result = 0;
-                for (int j = 0; j <= i; ++j)
-                {
-                    result = ArithmeticMod_q(result + f[j] * g[i - j]);
-                }
-                fg[i] = result;
-            }
-
-            for (int i = _p;i < _p+_p-1;++i)
-            {
-                result = 0;
-                for (int j = i-_p+1;j < _p;++j)
-                {
-                    result = ArithmeticMod_q(result + f[j] * g[i - j]);
-                }
-                fg[i] = result;
-            }
-
-            for (int i = _p+_p-2; i >= _p; --i)
-            {
-                fg[i - _p] = ArithmeticMod_q(fg[i - _p] + fg[i]);
-                fg[i-_p+1] = ArithmeticMod_q(fg[i-_p+1] + fg[i]);
-            }
-
-            Array.Copy(fg, 0, output, 0, _p);
+#endif
+            byte[] bytes = new byte[_p * 4];
+            random.NextBytes(bytes);
+            Pack.LE_To_UInt32(bytes, 0, L);
+            return L;
         }
 
         private void RqEncode(byte[] output, short[] r)
         {
             ushort[] R = new ushort[_p];
-            ushort[] M = new ushort[_p];
 
             for (int i = 0; i < _p; ++i)
             {
                 R[i] = (ushort)(r[i] + _q12);
-                M[i] = (ushort)_q;
             }
 
-            Encode(output, 0, R, M, _p);
+            Encode(output, R, _p, _q, _q);
         }
 
         private void RqDecode(short[] output, byte[] s)
         {
-            ushort[] R = new ushort[_p];
-            ushort[] M = new ushort[_p];
+            // Truncated input used to fail with this exception inside the List-based decoder this one replaced
+            if (s.Length < _rqBytes)
+                throw new ArgumentOutOfRangeException(nameof(s));
+
+            Decode(output, s, 0, _p, _q, _q);
 
             for (int i = 0; i < _p; ++i)
             {
-                M[i] = (ushort)_q;
-            }
-
-            List<byte> rList = new List<byte>(s);
-            List<ushort> mList = new List<ushort>(M);
-
-            List<ushort> decoded = Decode(rList, mList);
-
-            for (int i = 0; i < _p; ++i)
-            {
-                output[i] = (short)(decoded[i] - _q12);
+                output[i] = (short)(output[i] - _q12);
             }
         }
 
@@ -540,41 +328,6 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             }
         }
 
-        private void R3Mult(sbyte[] output, sbyte[] f, sbyte[] g)
-        {
-            sbyte[] fg = new sbyte[_p + _p + 1];
-            sbyte result;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                result = 0;
-                for (int j = 0; j <= i; ++j)
-                {
-                    result = (sbyte)(ArithmeticMod_3(result + f[j] * g[i - j]));
-                }
-                fg[i] = result;
-            }
-
-            for (int i = _p;i < _p+_p-1;++i)
-            {
-                result = 0;
-
-                for (int j = i-_p+1;j < _p;++j)
-                {
-                    result = (sbyte)(ArithmeticMod_3(result+f[j]*g[i-j]));
-                }
-                fg[i] = result;
-            }
-
-            for (int i = _p+_p-2;i >= _p;--i)
-            {
-                fg[i - _p] = (sbyte)(ArithmeticMod_3(fg[i - _p] + fg[i]));
-                fg[i - _p + 1] = (sbyte)(ArithmeticMod_3(fg[i - _p + 1] + fg[i]));
-            }
-
-            Array.Copy(fg, 0, output, 0, _p);
-        }
-
         private int WeightMask(sbyte[] r)
         {
             int weight = 0;
@@ -584,141 +337,141 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 weight += r[i]&1;
             }
 
-            return NonZeroMask((short)(weight - _w));
-        }
-
-        private int NonZeroMask(short x)
-        {
-            /* return -1 if x!=0; else return 0 */
-            return (x == 0) ? 0 : -1;
+            return NtruPrimeUtilities.NonZeroMask(weight - _w);
         }
 
         //---------------------------------------------------------------------
-        
-        private List<ushort> Decode(List<byte> S, List<ushort> M)
+
+        // The reference's Decode and Encode handle a list of values, each with its own modulus. Each level combines
+        // neighbouring values in pairs, takes bytes from the bottom of each pair's combined value while its combined
+        // modulus is at least 16384, and leaves the rest to the next level, carrying an unpaired last value over
+        // unchanged. Here all the moduli are equal at the top level, and pairing keeps them equal except for the last
+        // (only the last pair, or the unpaired last value, involves it), so a level is described by its count n, the
+        // common modulus m and the last value's modulus mLast.
+
+        // The number of bytes taken from the bottom of a pair's combined value, for combined modulus mm; leaves mm as
+        // the modulus of what remains
+        private static int PairBytes(ref int mm)
         {
-            int limit = 16384;
-
-            if (M.Count == 0)
+            int bytes = 0;
+            while (mm >= 16384)
             {
-                return new List<ushort>();
+                mm = (mm + 255) >> 8;
+                ++bytes;
             }
-
-            if (M.Count == 1)
-            {
-                if (M[0] == 1)
-                {
-                    return new List<ushort>() { 0 };
-                }
-                if (M[0] <= 256)
-                {
-                    return new List<ushort>() { (ushort)Mod(S[0], M[0]) };
-                } else
-                {
-                    return new List<ushort>() { (ushort)Mod(S[0] + (((uint)S[1]) << 8), M[0]) };
-                }
-            }
-
-            int k = 0;
-            List<ushort> bottomr = new List<ushort>();
-            List<uint> bottomt = new List<uint>();
-            List<ushort> M2 = new List<ushort>();
-
-            for (int i = 0; i < M.Count - 1; i += 2)
-            {
-                uint m = (uint)(M[i] * M[i + 1]);
-                ushort r = 0;
-                uint t = 1;
-
-                while (m >= limit)
-                {
-                    r = (ushort)(r + S[k] * t);
-                    t = t * 256;
-                    k = k + 1;
-                    m = (uint)System.Math.Floor((double)((m + 255) / 256));
-                }
-                bottomr.Add(r);
-                bottomt.Add(t);
-                M2.Add((ushort)m);
-            }
-
-            if (M.Count % 2 != 0)
-            {
-                M2.Add(M[M.Count - 1]);
-            }
-
-            List<byte> S2 = new List<byte>();
-
-            S2 = S.GetRange(k, S.Count - k);
-
-            List<ushort> R2 = Decode(S2, M2);
-
-            List<ushort> R = new List<ushort>();
-
-            for (int i = 0; i < M.Count - 1; i += 2)
-            {
-                uint r = bottomr[i / 2];
-                uint t = bottomt[i / 2];
-                r += (uint)(t * R2[i / 2]);
-                R.Add((ushort)Mod(r, M[i]));
-                R.Add((ushort)(Mod(System.Math.Floor((double)r / M[i]), M[i + 1])));
-            }
-            if (M.Count % 2 != 0)
-            {
-                R.Add(R2[M2.Count - 1]);
-            }
-            return R;
+            return bytes;
         }
 
-        private int Encode(byte[] output, int outputPos, ushort[] R, ushort[] M, long len)
+        // Decodes n values from s at sOff into output[0 .. n - 1]: the last below mLast, the others below m. The input
+        // is public (a public key or ciphertext), so the divisions are fine.
+        private static void Decode(short[] output, byte[] s, int sOff, int n, int m, int mLast)
         {
-            int limit = 16384;
-            if (len == 1)
+            if (n == 1)
             {
-                ushort r = R[0];
-                ushort m = M[0];
-
-                while (m > 1)
+                if (mLast == 1)
                 {
-                    output[outputPos++] = Decimal.ToByte(r % 256);
-                    r >>= 8;
-                    m = (ushort)((m + 255) >> 8);
+                    output[0] = 0;
                 }
+                else if (mLast <= 256)
+                {
+                    output[0] = (short)(s[sOff] % mLast);
+                }
+                else
+                {
+                    output[0] = (short)((s[sOff] | s[sOff + 1] << 8) % mLast);
+                }
+                return;
             }
 
-            if (len > 1)
+            int pairs = n >> 1;
+            bool lastPaired = (n & 1) == 0;
+
+            int m2 = m * m, b = PairBytes(ref m2);
+            int m2Last = mLast, bLast = 0;
+            if (lastPaired)
             {
-                ushort[] R2 = new ushort[(len + 1) / 2];
-                ushort[] M2 = new ushort[(len + 1) / 2];
+                m2Last = m * mLast;
+                bLast = PairBytes(ref m2Last);
+            }
 
-                int i;
-                for (i = 0; i < len - 1; i += 2)
+            // The pairs' bottom bytes come first, then the next level's encoding, which is decoded into the start of
+            // output and then expanded in place, from the end down so that no value is overwritten before it is read.
+            int bottomBytes = (lastPaired ? pairs - 1 : pairs) * b + bLast;
+            Decode(output, s, sOff + bottomBytes, pairs + (n & 1), m2, m2Last);
+
+            if (!lastPaired)
+            {
+                output[n - 1] = output[pairs];
+            }
+
+            for (int j = pairs - 1; j >= 0; --j)
+            {
+                bool last = lastPaired && j == pairs - 1;
+                int bj = last ? bLast : b;
+                int bOff = sOff + j * b;
+
+                uint r = (uint)output[j] << (8 * bj);
+                for (int k = 0; k < bj; ++k)
                 {
-                    uint m0 = M[i];
-                    uint r = R[i] + R[i + 1] * m0;
-                    uint m = M[i + 1] * m0;
+                    r |= (uint)s[bOff + k] << (8 * k);
+                }
 
-                    while (m >= limit)
+                output[2 * j] = (short)(r % (uint)m);
+                // the reduction is only needed for invalid inputs
+                output[2 * j + 1] = (short)(r / (uint)m % (uint)(last ? mLast : m));
+            }
+        }
+
+        // Encodes n values from R into output: the last below mLast, the others below m. Overwrites R. The sequence of
+        // operations depends only on n, m and mLast.
+        private static void Encode(byte[] output, ushort[] R, int n, int m, int mLast)
+        {
+            int pos = 0;
+
+            while (n > 1)
+            {
+                int pairs = n >> 1;
+                bool lastPaired = (n & 1) == 0;
+
+                int m2 = m * m, b = PairBytes(ref m2);
+                int m2Last = mLast, bLast = 0;
+                if (lastPaired)
+                {
+                    m2Last = m * mLast;
+                    bLast = PairBytes(ref m2Last);
+                }
+
+                // Pair j's combined value replaces R[j], which has been read by then
+                for (int j = 0; j < pairs; ++j)
+                {
+                    int bj = lastPaired && j == pairs - 1 ? bLast : b;
+
+                    uint r = R[2 * j] + R[2 * j + 1] * (uint)m;
+                    for (int k = 0; k < bj; ++k)
                     {
-                        output[outputPos++] = Decimal.ToByte(r % 256);
+                        output[pos++] = (byte)r;
                         r >>= 8;
-                        m = (m + 255) >> 8;
                     }
-
-                    R2[i / 2] = (ushort)r;
-                    M2[i / 2] = (ushort)m;
+                    R[j] = (ushort)r;
                 }
 
-                if (i < len)
+                if (!lastPaired)
                 {
-                    R2[i / 2] = R[i];
-                    M2[i / 2] = M[i];
+                    R[pairs] = R[n - 1];
                 }
 
-                outputPos = Encode(output, outputPos, R2, M2, (len + 1) / 2);
+                n = pairs + (n & 1);
+                m = m2;
+                mLast = m2Last;
             }
 
-            return outputPos;
+            uint r0 = R[0];
+            while (mLast > 1)
+            {
+                output[pos++] = (byte)r0;
+                r0 >>= 8;
+                mLast = (mLast + 255) >> 8;
+            }
         }
 
         private void Encrypt(byte[] output, sbyte[] r, byte[] pk) // ZEncrypt
@@ -748,11 +501,11 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 short[] bG = new short[_p];
                 short[] bA = new short[_p];
 
-                RqMult(ref bG, G, ref b);
+                NtruPrimeUtilities.RqMult(bG, G, b, _p, _q);
 
                 Round(B, bG);
 
-                RqMult(ref bA, A, ref b);
+                NtruPrimeUtilities.RqMult(bA, A, b, _p, _q);
 
                 for (int i = 0; i < _I; ++i)
                 {
@@ -760,7 +513,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 }
                 // END: Encrypt
                 // END: XEncrypt
-            
+
                 RoundedEncode(output, B);
                 byte[] topEncOut = new byte[output.Length];
                 TopEncode(topEncOut, T);
@@ -775,7 +528,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
                 // Encrypt
                 short[] hr = new short[_p];
-                RqMult(ref hr, h, r);
+                NtruPrimeUtilities.RqMult(hr, h, r, _p, _q);
                 Round(c, hr);
                 // END Encrypt
 
@@ -801,12 +554,12 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 // BEGIN: XDecrypt
                 short[] aB = new short[_p];
 
-                RqMult(ref aB, B, ref a);
+                NtruPrimeUtilities.RqMult(aB, B, a, _p, _q);
 
                 for (int i = 0; i < _I; ++i)
                 {
-                    int freeze = Right(T[i]) - aB[i] + 4 * _w + 1;
-                    output[i] = (sbyte)(-NegativeMask((short)(Mod(freeze + _q12, _q) - _q12)));
+                    int freeze = ArithmeticMod_q(Right(T[i]) - aB[i] + 4 * _w + 1);
+                    output[i] = (sbyte)(-NtruPrimeUtilities.NegativeMask(freeze));
                 }
                 // END: XDecrypt
             }
@@ -832,10 +585,10 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 sbyte[] e = new sbyte[_p];
                 sbyte[] ev = new sbyte[_p];
 
-                RqMult(ref cf, c2, f);
+                NtruPrimeUtilities.RqMult(cf, c2, f, _p, _q);
                 RqMult3(cf3, cf);
                 R3FromRq(e, cf3);
-                R3Mult(ev, e, v);
+                NtruPrimeUtilities.R3Mult(ev, e, v, _p);
 
                 int mask = WeightMask(ev);
 
@@ -895,77 +648,30 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             return Pack.LE_To_UInt32(data, 0, _p);
         }
 
+        // Short_random
         private void ShortRandom(sbyte[] output, SecureRandom random)
         {
-            uint[] L = new uint[_p];
-            byte[] shortRandom = new byte[4];
-
-            for (int i = 0; i < _p; ++i)
-            {
-                random.NextBytes(shortRandom);
-                L[i] = BitConverter.ToUInt32(shortRandom, 0);
-            }
-            ShortFromList(output, L);
+            ShortFromList(output, RandomUInt32s(random));
         }
 
-        private void ShortFromList(sbyte[] output, uint[] L_in)
+        // Overwrites L, which the callers discard
+        private void ShortFromList(sbyte[] output, uint[] L)
         {
-            uint[] L = new uint[_p];
-
             for (int i = 0; i < _w; ++i)
             {
-                L[i] = (uint)(L_in[i] & -2);
-            }
-            
-            for (int i = _w; i < _p; ++i)
-            {
-                L[i] = (uint)(L_in[i] & -3) | 1;
+                L[i] &= ~1U;
             }
 
-            Array.Sort(L);
+            for (int i = _w; i < _p; ++i)
+            {
+                L[i] = (L[i] & ~3U) | 1U;
+            }
+
+            NtruPrimeUtilities.SortUInt32(L);
 
             for (int i = 0; i < _p; ++i)
             {
                 output[i] = (sbyte)((L[i] & 3) - 1);
-            }
-        }
-
-        private void RqMult(ref short[] output, short[] G, ref sbyte[] a) // aG, G, a -> h, f, g
-        {
-            short[] fg = new short[_p + _p - 1];
-            short result;
-
-            for (int i = 0; i < _p; ++i)
-            {
-                result = 0;
-                for (int j = 0; j <= i; ++j)
-                {
-                    result = ArithmeticMod_q(result + (G[j] * a[i - j]));
-                }
-
-                fg[i] = result;
-            }
-
-            for (int i = _p; i < _p + _p - 1; ++i)
-            {
-                result = 0;
-                for (int j = i - _p + 1; j < _p; ++j)
-                {
-                    result = ArithmeticMod_q(result + (G[j] * a[i - j]));
-                }
-
-                fg[i] = result;
-            }
-
-            for (int i = _p + _p - 2; i >= _p; --i)
-            {
-                fg[i - _p] = ArithmeticMod_q(fg[i - _p] + fg[i]);
-                fg[i - _p + 1] = ArithmeticMod_q(fg[i - _p + 1] + fg[i]);
-            }
-
-            for (int i = 0; i < _p; ++i)
-            {
-                output[i] = fg[i];
             }
         }
 
@@ -976,7 +682,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
                 output[i] = (short)(aG[i] - ArithmeticMod_3(aG[i]));
             }
         }
-        
+
         private void InputsRandom(sbyte[] output, SecureRandom random)
         {
             byte[] s = new byte[_inputsBytes];
@@ -1003,36 +709,28 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
         private void RoundedEncode(byte[] output, short[] A)
         {
             ushort[] R = new ushort[_p];
-            ushort[] M = new ushort[_p];
 
             for (int i = 0; i < _p; ++i)
             {
                 R[i] = (ushort)(((A[i] + _q12) * 10923) >> 15);
             }
 
-            for (int i = 0; i < _p; ++i)
-            {
-                M[i] = (ushort)((_q + 2) / 3);
-            }
-
-            Encode(output, 0, R, M, _p);
+            int m = (_q + 2) / 3;
+            Encode(output, R, _p, m, m);
         }
 
         private void RoundedDecode(short[] output, byte[] s)
         {
-            List<ushort> M = new List<ushort>(_p);
-            List<byte> S = new List<byte>(s);
+            // Truncated input used to fail with this exception inside the List-based decoder this one replaced
+            if (s.Length < _roundedBytes)
+                throw new ArgumentOutOfRangeException(nameof(s));
+
+            int m = (_q + 2) / 3;
+            Decode(output, s, 0, _p, m, m);
 
             for (int i = 0; i < _p; ++i)
             {
-                M.Add((ushort)((_q + 2) / 3));
-            }
-
-            List<ushort> decoded = Decode(S, M);
-
-            for (int i = 0; i < _p; ++i)
-            {
-                output[i] = (short)((decoded[i] * 3) - _q12);
+                output[i] = (short)(output[i] * 3 - _q12);
             }
         }
 
@@ -1091,11 +789,9 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
         {
             byte[] s = new byte[_inputsBytes];
             byte[] h = new byte[_hashBytes];
-            uint[] L = new uint[_p];
-
             InputsEncode(s, r);
             HashPrefix(h, 5, s, s.Length);
-            L = Expand(h);
+            uint[] L = Expand(h);
             ShortFromList(output, L);
         }
 
@@ -1161,11 +857,6 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             Array.Copy(hash, 0, output, 0, output.Length);
         }
 
-        private int NegativeMask(short x)
-        {
-            return (int)x >> 31;
-        }
-
         private int ctDiffMask(byte[] c, byte[] c2)
         {
             int x = c.Length ^ c2.Length;
@@ -1175,23 +866,19 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
             }
 
             // Return 0 if matching, else -1
-            return x == 0 ? 0 : -1;
+            return (-x | x) >> 31;
         }
 
         // Arithmetics
-        private double Mod(double a, double b)
-        {
-            return a - b * System.Math.Floor(a / b);
-        }
 
         private short ArithmeticMod_q(int x)  // Fq_freeze
         {
-            return (short)((Mod(x + _q12, _q)) - _q12);
+            return (short)NtruPrimeUtilities.Freeze(x, _q, _qBarrett);
         }
 
         private short ArithmeticMod_3(int x) // F3_freeze
         {
-            return (short)(Mod(x + 1, 3) - 1);
+            return (short)NtruPrimeUtilities.Freeze3(x);
         }
 
         private sbyte Top(int C)
@@ -1201,8 +888,7 @@ namespace Org.BouncyCastle.Pqc.Crypto.NtruPrime
 
         private short Right(sbyte T)
         {
-            int freeze = _tau3 * T - _tau2;
-            return (short)(Mod(freeze + _q12, _q) - _q12);
+            return ArithmeticMod_q(_tau3 * T - _tau2);
         }
     }
 }

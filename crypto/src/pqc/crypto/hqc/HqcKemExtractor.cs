@@ -21,12 +21,20 @@ namespace Org.BouncyCastle.Pqc.Crypto.Hqc
 
         public byte[] ExtractSecret(byte[] encapsulation)
         {
+            if (encapsulation == null)
+                throw new ArgumentNullException(nameof(encapsulation));
+            // Decaps reads u, v and the salt at fixed offsets and only compares u and v, so without this check
+            // trailing bytes would be ignored and a lengthened ciphertext would decapsulate to the same secret
+            if (encapsulation.Length != m_engine.CipherTextBytes)
+                throw new ArgumentException($"Expected length {m_engine.CipherTextBytes}", nameof(encapsulation));
+
             byte[] ss = new byte[64];
-            byte[] sk = m_privateKey.InternalPrivateKey;
 
-            m_engine.Decaps(ss, ct: encapsulation, sk);
+            m_engine.Decaps(ss, ct: encapsulation, m_privateKey.GetExpandedKey());
 
-            return Arrays.CopySegment(ss, 0, 32);
+            byte[] secret = Arrays.CopySegment(ss, 0, 32);
+            Arrays.ZeroMemory(ss);
+            return secret;
         }
 
         public int EncapsulationLength => m_engine.CipherTextBytes;

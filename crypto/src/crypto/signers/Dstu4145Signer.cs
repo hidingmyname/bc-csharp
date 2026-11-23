@@ -17,8 +17,10 @@ namespace Org.BouncyCastle.Crypto.Signers
         private ECKeyParameters m_key;
         private SecureRandom m_random;
 
+        /// <inheritdoc/>
         public virtual string AlgorithmName => "DSTU4145";
 
+        /// <inheritdoc/>
         public virtual void Init(bool forSigning, ICipherParameters parameters)
         {
             if (forSigning)
@@ -41,8 +43,10 @@ namespace Org.BouncyCastle.Crypto.Signers
             }
         }
 
+        /// <inheritdoc/>
         public virtual BigInteger Order => m_key.Parameters.N;
 
+        /// <inheritdoc/>
         public virtual BigInteger[] GenerateSignature(byte[] message)
         {
             ECDomainParameters ec = m_key.Parameters;
@@ -79,13 +83,16 @@ namespace Org.BouncyCastle.Crypto.Signers
                 }
                 while (r.SignValue < 1);
 
-                s = r.Multiply(d).Add(e).Mod(n);
+                // keeping the secret d and ephemeral e off BigInteger.Mod, whose cost follows the quotient; d is in
+                // [1, n-1] by ValidatePrivateScalar, e is drawn in that range, and r is truncated below 2^(|n| - 1)
+                s = BigIntegers.ModAdd(n, BigIntegers.ModMult(n, r, d), e);
             }
             while (s.SignValue < 1);
 
             return new BigInteger[]{ r, s };
         }
 
+        /// <inheritdoc/>
         public virtual bool VerifySignature(byte[] message, BigInteger r, BigInteger s)
         {
             ECDomainParameters parameters = m_key.Parameters;
@@ -114,6 +121,8 @@ namespace Org.BouncyCastle.Crypto.Signers
             return FieldElement2Integer(n, y).Equals(r);
         }
 
+        /// <summary>Create the multiplier used for multiplying the base point.</summary>
+        /// <returns>The multiplier.</returns>
         protected virtual ECMultiplier CreateBasePointMultiplier() => new FixedPointCombMultiplier();
 
         private static ECFieldElement Hash2FieldElement(ECCurve curve, byte[] hash)

@@ -42,21 +42,34 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// However, due to the small uncertainties if p and q are not prime,
         /// advanced attacks are not prevented.
         /// Use it at your own risk.
-        /// 
+        ///
         /// Throws NullReferenceException if any argument is null. Throws
         /// InvalidOperationException is any of the above validations fail.
         /// </summary>
         public JPakePrimeOrderGroup(BigInteger p, BigInteger q, BigInteger g)
-            : this(p, q, g, false)
         {
-             // Don't skip the checks on user-specified groups.
+            JPakeUtilities.ValidateNotNull(p, "p");
+            JPakeUtilities.ValidateNotNull(q, "q");
+            JPakeUtilities.ValidateNotNull(g, "g");
+
+            // Don't skip the checks on user-specified groups.
+            CheckGroup(p, q, g);
+
+            this.p = p;
+            this.q = q;
+            this.g = g;
         }
 
         /// <summary>
         /// Constructor used by the pre-approved groups in JPakePrimeOrderGroups.
         /// These pre-approved groups can avoid the expensive checks.
         /// User-specified groups should not use this constructor.
+        ///
+        /// Skipping the checks is only safe for a group known to be valid: J-PAKE blinds its private exponents with
+        /// multiples of q, which leaves the results unchanged only if g^q mod p equals 1.
         /// </summary>
+        // TODO[api] Make this internal.
+        [Obsolete("Use 'JPakePrimeOrderGroup(p, q, g)' or a group from 'JPakePrimeOrderGroups' instead")]
         public JPakePrimeOrderGroup(BigInteger p, BigInteger q, BigInteger g, bool skipChecks)
         {
             JPakeUtilities.ValidateNotNull(p, "p");
@@ -65,19 +78,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
 
             if (!skipChecks)
             {
-                if (!p.Subtract(JPakeUtilities.One).Mod(q).Equals(JPakeUtilities.Zero))
-                    throw new ArgumentException("p-1 must be evenly divisible by q");
-                if (g.CompareTo(BigInteger.Two) < 0 || g.CompareTo(p) >= 0)
-                    throw new ArgumentException("g must be in [2, p-1]");
-                if (!g.ModPow(q, p).Equals(JPakeUtilities.One))
-                    throw new ArgumentException("g^q mod p must equal 1");
-
-                // Note these checks do not guarantee that p and q are prime.
-                // We just have reasonable certainty that they are prime.
-                if (!p.IsProbablePrime(20))
-                    throw new ArgumentException("p must be prime");
-                if (!q.IsProbablePrime(20))
-                    throw new ArgumentException("q must be prime");
+                CheckGroup(p, q, g);
             }
 
             this.p = p;
@@ -85,16 +86,36 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
             this.g = g;
         }
 
+        private static void CheckGroup(BigInteger p, BigInteger q, BigInteger g)
+        {
+            if (!p.Subtract(JPakeUtilities.One).Mod(q).Equals(JPakeUtilities.Zero))
+                throw new ArgumentException("p-1 must be evenly divisible by q");
+            if (g.CompareTo(BigInteger.Two) < 0 || g.CompareTo(p) >= 0)
+                throw new ArgumentException("g must be in [2, p-1]");
+            if (!g.ModPow(q, p).Equals(JPakeUtilities.One))
+                throw new ArgumentException("g^q mod p must equal 1");
+
+            // Note these checks do not guarantee that p and q are prime.
+            // We just have reasonable certainty that they are prime.
+            if (!p.IsProbablePrime(20))
+                throw new ArgumentException("p must be prime");
+            if (!q.IsProbablePrime(20))
+                throw new ArgumentException("q must be prime");
+        }
+
+        /// <summary>Gets the p.</summary>
         public virtual BigInteger P
         {
             get { return p; }
         }
 
+        /// <summary>Gets the q.</summary>
         public virtual BigInteger Q
         {
             get { return q; }
         }
 
+        /// <summary>Gets the g.</summary>
         public virtual BigInteger G
         {
             get { return g; }

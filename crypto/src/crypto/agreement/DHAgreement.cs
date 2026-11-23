@@ -4,6 +4,7 @@ using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Math;
 using Org.BouncyCastle.Security;
+using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Agreement
 {
@@ -27,6 +28,11 @@ namespace Org.BouncyCastle.Crypto.Agreement
         private SecureRandom m_random;
         private BigInteger m_privateValue;
 
+        /// <summary>Initialise the agreement with the private key of this party.</summary>
+        /// <param name="parameters">
+        /// The private key (<see cref="DHPrivateKeyParameters"/>), optionally with a source of randomness.
+        /// </param>
+        /// <exception cref="ArgumentException">The parameters do not hold a Diffie-Hellman private key.</exception>
         public void Init(ICipherParameters parameters)
         {
             var kParam = ParameterUtilities.GetRandom(parameters, out var providedRandom);
@@ -81,11 +87,17 @@ namespace Org.BouncyCastle.Crypto.Agreement
                 ? pub.Y
                 : new DHPublicKeyParameters(pub.Y, m_dhParams).Y;
 
+            // m_privateValue is this run's ephemeral value, made by CalculateMessage: nothing accumulates against a
+            // value used once, so this exponentiation is left as it is.
             BigInteger result = peerY.ModPow(m_privateValue, p);
             if (result.Equals(BigInteger.One))
                 throw new InvalidOperationException("Shared key can't be 1");
 
-            return peerMessage.ModPow(m_key.X, p).Multiply(result).Mod(p);
+            // The peer chooses the base that is raised to the long-term key, so that base is blinded: the timing of
+            // the variable-time ModPow could otherwise be accumulated against the key over many agreements.
+            BigInteger staticPart = BigIntegers.ModPowBaseBlinded(p, peerMessage, m_key.X, m_random);
+
+            return staticPart.Multiply(result).Mod(p);
         }
     }
 }

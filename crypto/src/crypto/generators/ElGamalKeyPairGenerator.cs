@@ -13,24 +13,30 @@ namespace Org.BouncyCastle.Crypto.Generators
      */
     // TODO[api] sealed
     public class ElGamalKeyPairGenerator
-		: IAsymmetricCipherKeyPairGenerator
+        : IAsymmetricCipherKeyPairGenerator
     {
         private ElGamalKeyGenerationParameters m_parameters;
 
+        /// <inheritdoc/>
         public void Init(KeyGenerationParameters parameters)
         {
-            m_parameters = (ElGamalKeyGenerationParameters)parameters;
+            var elGamalParameters = (ElGamalKeyGenerationParameters)parameters;
+
+            ElGamalParameters egp = elGamalParameters.Parameters;
+            DHKeyGeneratorHelper.CheckPrivateValueLength(egp.P, egp.L, nameof(parameters));
+
+            m_parameters = elGamalParameters;
         }
 
+        /// <inheritdoc/>
         public AsymmetricCipherKeyPair GenerateKeyPair()
         {
-			ElGamalParameters egp = m_parameters.Parameters;
-			DHParameters dhp = new DHParameters(egp.P, egp.G, null, 0, egp.L);
+            ElGamalParameters egp = m_parameters.Parameters;
+            DHParameters dhp = new DHParameters(egp.P, egp.G, null, 0, egp.L);
 
-			BigInteger x = DHKeyGeneratorHelper.CalculatePrivate(dhp, m_parameters.Random);
-			BigInteger y = DHKeyGeneratorHelper.CalculatePublic(dhp, x);
+            DHKeyGeneratorHelper.CalculateKeyPair(dhp, m_parameters.Random, out BigInteger x, out BigInteger y);
 
-			return new AsymmetricCipherKeyPair(
+            return new AsymmetricCipherKeyPair(
                 new ElGamalPublicKeyParameters(y, egp),
                 new ElGamalPrivateKeyParameters(x, egp));
         }
