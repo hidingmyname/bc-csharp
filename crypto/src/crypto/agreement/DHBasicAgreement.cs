@@ -3,6 +3,7 @@ using System;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Math;
 using Org.BouncyCastle.Security;
+using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Agreement
 {
@@ -19,18 +20,22 @@ namespace Org.BouncyCastle.Crypto.Agreement
     {
         private DHPrivateKeyParameters m_key;
         private DHParameters m_dhParams;
+        private SecureRandom m_random;
 
+        /// <inheritdoc/>
         public virtual void Init(ICipherParameters parameters)
         {
-            var kParam = ParameterUtilities.IgnoreRandom(parameters);
+            var kParam = ParameterUtilities.GetRandom(parameters, out var providedRandom);
 
             if (!(kParam is DHPrivateKeyParameters dhPrivateKeyParameters))
                 throw new ArgumentException($"{nameof(DHBasicAgreement)} expects {nameof(DHPrivateKeyParameters)}");
 
             m_key = dhPrivateKeyParameters;
             m_dhParams = m_key.Parameters;
+            m_random = CryptoServicesRegistrar.GetSecureRandom(providedRandom);
         }
 
+        /// <inheritdoc/>
         public virtual int GetFieldSize() => (m_key.Parameters.P.BitLength + 7) / 8;
 
         /// <summary>
@@ -48,11 +53,17 @@ namespace Org.BouncyCastle.Crypto.Agreement
 
             BigInteger p = m_dhParams.P;
 
-            BigInteger peerY = pub.Y;
-            if (peerY == null || peerY.CompareTo(BigInteger.One) <= 0 || peerY.CompareTo(p.Subtract(BigInteger.One)) >= 0)
-                throw new ArgumentException("Diffie-Hellman public key is weak");
+            // A normally-constructed DHPublicKeyParameters already validated its Y (range, and subgroup when the
+            // parameters carry q); but Y is virtual and a subclass can override it to return an unvalidated value, so
+            // re-validate unless pub is exactly the base type.
+            BigInteger peerY = pub.GetType() == typeof(DHPublicKeyParameters)
+                ? pub.Y
+                : new DHPublicKeyParameters(pub.Y, m_dhParams).Y;
 
-            BigInteger result = peerY.ModPow(m_key.X, p);
+            // The exponent is our private value, long lived for static-static agreement, and the peer chooses the base,
+            // so the base is blinded: the timing of the variable-time ModPow could otherwise be accumulated against
+            // the key over many agreements. A key used only once gains nothing from this, but that cannot be told here.
+            BigInteger result = BigIntegers.ModPowBaseBlinded(p, peerY, m_key.X, m_random);
             if (result.Equals(BigInteger.One))
                 throw new InvalidOperationException("Shared key can't be 1");
 

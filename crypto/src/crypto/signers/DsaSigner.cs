@@ -14,9 +14,12 @@ namespace Org.BouncyCastle.Crypto.Signers
     public class DsaSigner
         : IDsa
     {
+        /// <summary>The calculator for the per-signature value <c>k</c>.</summary>
         protected readonly IDsaKCalculator kCalculator;
 
+        /// <summary>The key in use.</summary>
         protected DsaKeyParameters key = null;
+        /// <summary>The source of randomness.</summary>
         protected SecureRandom random = null;
 
         /**
@@ -37,12 +40,14 @@ namespace Org.BouncyCastle.Crypto.Signers
             this.kCalculator = kCalculator;
         }
 
+        /// <inheritdoc/>
         public virtual string AlgorithmName
         {
             get { return "DSA"; }
         }
 
-        public virtual void Init(bool forSigning, ICipherParameters	parameters)
+        /// <inheritdoc/>
+        public virtual void Init(bool forSigning, ICipherParameters parameters)
         {
             if (forSigning)
             {
@@ -52,7 +57,8 @@ namespace Org.BouncyCastle.Crypto.Signers
                     throw new InvalidKeyException("DSA private key required for signing");
 
                 this.key = dsaPrivateKeyParameters;
-                this.random = InitSecureRandom(!kCalculator.IsDeterministic, providedRandom);
+                // needed even for a deterministic k: signing blinds the exponent
+                this.random = InitSecureRandom(true, providedRandom);
             }
             else
             {
@@ -64,6 +70,7 @@ namespace Org.BouncyCastle.Crypto.Signers
             }
         }
 
+        /// <inheritdoc/>
         public virtual BigInteger Order
         {
             get { return key.Parameters.Q; }
@@ -80,7 +87,8 @@ namespace Org.BouncyCastle.Crypto.Signers
         {
             DsaParameters parameters = key.Parameters;
             BigInteger q = parameters.Q;
-            BigInteger m = CalculateE(q, message);
+            // m is public, and CalculateE can leave it at or past q, which ModAdd below rejects rather than reduces
+            BigInteger m = CalculateE(q, message).Mod(q);
             BigInteger x = ((DsaPrivateKeyParameters)key).X;
 
             if (kCalculator.IsDeterministic)
@@ -94,11 +102,15 @@ namespace Org.BouncyCastle.Crypto.Signers
 
             BigInteger k = kCalculator.NextK();
 
-            BigInteger r = parameters.G.ModPow(k, parameters.P).Mod(q);
+            // k gives up x through s if it leaks, so the exponent is blinded with a random multiple of q before the
+            // variable-time ModPow; g has order q, so r is unchanged
+            BigInteger blindedK = BigIntegers.CreateBlindedExponent(k, q, random);
+            BigInteger r = parameters.G.ModPow(blindedK, parameters.P).Mod(q);
 
-            k = BigIntegers.ModOddInverse(q, k).Multiply(m.Add(x.Multiply(r)));
-
-            BigInteger s = k.Mod(q);
+            // s = k^-1 * (m + x * r) mod q, keeping the secret x and k^-1 off BigInteger.Mod, whose cost follows the
+            // quotient; x is in [1, q-1] by DsaPrivateKeyParameters, r is reduced, and q is prime and so odd
+            BigInteger s = BigIntegers.ModMult(q, BigIntegers.ModOddInverse(q, k),
+                BigIntegers.ModAdd(q, m, BigIntegers.ModMult(q, x, r)));
 
             return new BigInteger[]{ r, s };
         }
@@ -138,6 +150,10 @@ namespace Org.BouncyCastle.Crypto.Signers
             return v.Equals(r);
         }
 
+        /// <summary>Calculate the integer <c>e</c> to sign from a message.</summary>
+        /// <param name="n">The order of the group.</param>
+        /// <param name="message">The message hash.</param>
+        /// <returns>The integer <c>e</c>.</returns>
         protected virtual BigInteger CalculateE(BigInteger n, byte[] message)
         {
             int length = System.Math.Min(message.Length, n.BitLength / 8);
@@ -145,6 +161,10 @@ namespace Org.BouncyCastle.Crypto.Signers
             return new BigInteger(1, message, 0, length);
         }
 
+        /// <summary>Obtain a source of randomness for signing.</summary>
+        /// <param name="needed">true if randomness is needed, as for signing.</param>
+        /// <param name="provided">A source of randomness that was provided, or null.</param>
+        /// <returns>The source of randomness to use, or null if none is needed.</returns>
         protected virtual SecureRandom InitSecureRandom(bool needed, SecureRandom provided)
         {
             return !needed ? null : CryptoServicesRegistrar.GetSecureRandom(provided);

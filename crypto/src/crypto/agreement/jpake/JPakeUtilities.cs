@@ -11,16 +11,18 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
 {
     /// <summary>
     /// Primitives needed for a J-PAKE exchange.
-    /// 
+    ///
     /// The recommended way to perform a J-PAKE exchange is by using
     /// two JPAKEParticipants.  Internally, those participants
     /// call these primitive operations in JPakeUtilities.
-    /// 
+    ///
     /// The primitives, however, can be used without a JPAKEParticipant if needed.
     /// </summary>
     public abstract class JPakeUtilities
     {
+        /// <summary>The value zero.</summary>
         public static readonly BigInteger Zero = BigInteger.Zero;
+        /// <summary>The value one.</summary>
         public static readonly BigInteger One = BigInteger.One;
 
         /// <summary>
@@ -81,9 +83,33 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// <summary>
         /// Calculate g^x mod p as done in round 1.
         /// </summary>
+        /// <remarks>
+        /// x is a private ephemeral value, and without q to blind the exponent with, a multiple of p - 1 is used
+        /// instead: always sound, but it grows the exponent from the size of q to the size of p.
+        /// </remarks>
+        [Obsolete("Use 'CalculateGx(p, q, g, x, random)' instead")]
         public static BigInteger CalculateGx(BigInteger p, BigInteger g, BigInteger x)
         {
-            return g.ModPow(x, p);
+            return g.ModPow(BlindExponent(x, p.Subtract(One), null), p);
+        }
+
+        /// <summary>
+        /// Calculate g^x mod p as done in round 1.
+        /// </summary>
+        /// <remarks>
+        /// x is the participant's private ephemeral value, and leaking it lets an attacker brute-force the password,
+        /// so the exponent is blinded with a random multiple of q. g must have order q, as checked when a
+        /// <see cref="JPakePrimeOrderGroup"/> is built.
+        /// </remarks>
+        /// <param name="p">The prime modulus.</param>
+        /// <param name="q">The prime order of g.</param>
+        /// <param name="g">The generator.</param>
+        /// <param name="x">The private exponent.</param>
+        /// <param name="random">The source of the blinding, or null for the default.</param>
+        public static BigInteger CalculateGx(BigInteger p, BigInteger q, BigInteger g, BigInteger x,
+            SecureRandom random)
+        {
+            return g.ModPow(BlindExponent(x, q, random), p);
         }
 
         /// <summary>
@@ -91,7 +117,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// </summary>
         public static BigInteger CalculateGA(BigInteger p, BigInteger gx1, BigInteger gx3, BigInteger gx4)
         {
-            // ga = g^(x1+x3+x4) = g^x1 * g^x3 * g^x4 
+            // ga = g^(x1+x3+x4) = g^x1 * g^x3 * g^x4
             return gx1.ModMultiply(gx3, p).ModMultiply(gx4, p);
         }
 
@@ -100,16 +126,36 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// </summary>
         public static BigInteger CalculateX2s(BigInteger q, BigInteger x2, BigInteger s)
         {
-            return x2.ModMultiply(s, q);
+            // x2 * s carries the password, so it is formed in fixed time rather than by ModMultiply, whose reduction
+            // follows the value
+            return BigIntegers.ModMult(q, Reduce(q, x2), Reduce(q, s));
         }
 
         /// <summary>
-        /// Calculate A as done in round 2. 
+        /// Calculate A as done in round 2.
         /// </summary>
         public static BigInteger CalculateA(BigInteger p, BigInteger q, BigInteger gA, BigInteger x2s)
         {
+            return CalculateA(p, q, gA, x2s, null);
+        }
+
+        /// <summary>
+        /// Calculate A as done in round 2.
+        /// </summary>
+        /// <remarks>
+        /// x2s carries the password, so the exponent is blinded with a random multiple of q. gA must have order q; as
+        /// formed by <see cref="CalculateGA"/>, it is a product of values each checked to have order q.
+        /// </remarks>
+        /// <param name="p">The prime modulus.</param>
+        /// <param name="q">The prime order of gA.</param>
+        /// <param name="gA">The base, from <see cref="CalculateGA"/>.</param>
+        /// <param name="x2s">The private exponent, from <see cref="CalculateX2s"/>.</param>
+        /// <param name="random">The source of the blinding, or null for the default.</param>
+        public static BigInteger CalculateA(BigInteger p, BigInteger q, BigInteger gA, BigInteger x2s,
+            SecureRandom random)
+        {
             // A = ga^(x*s)
-            return gA.ModPow(x2s, p);
+            return gA.ModPow(BlindExponent(x2s, q, random), p);
         }
 
         /// <summary>
@@ -124,14 +170,16 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
             BigInteger vMax = q.Subtract(One);
             BigInteger v = BigIntegers.CreateRandomInRange(vMin, vMax, random);
 
-            BigInteger gv = g.ModPow(v, p);
+            // r below is published, so recovering v from the timing of this call would give up x as (v - r) / h; the
+            // exponent is blinded with a random multiple of q, g having order q
+            BigInteger gv = g.ModPow(BlindExponent(v, q, random), p);
             BigInteger h = CalculateHashForZeroKnowledgeProof(g, gv, gx, participantId, digest); // h
 
-            return new BigInteger[]
-            {
-                gv,
-                v.Subtract(x.Multiply(h)).Mod(q) // r = v-x*h
-            };
+            // r = v - x * h, formed in fixed time since x and v are secret; h is public and may be negative
+            BigInteger xh = BigIntegers.ModMult(q, Reduce(q, x), h.Mod(q));
+            BigInteger r = BigIntegers.ModSubtract(q, v, xh);
+
+            return new BigInteger[]{ gv, r };
         }
 
         private static BigInteger CalculateHashForZeroKnowledgeProof(BigInteger g, BigInteger gr, BigInteger gx,
@@ -164,12 +212,12 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
 
         /// <summary>
         /// Validates that ga is not 1.
-        /// 
+        ///
         /// As described by Feng Hao...
         /// Alice could simply check ga != 1 to ensure it is a generator.
         /// In fact, as we will explain in Section 3, (x1 + x3 + x4 ) is random over Zq even in the face of active attacks.
         /// Hence, the probability for ga = 1 is extremely small - on the order of 2^160 for 160-bit q.
-        /// 
+        ///
         /// throws CryptoException if ga is 1
         /// </summary>
         public static void ValidateGa(BigInteger ga)
@@ -182,7 +230,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// Validates the zero knowledge proof (generated by
         /// calculateZeroKnowledgeProof(BigInteger, BigInteger, BigInteger, BigInteger, BigInteger, string, Digest, SecureRandom)
         /// is correct.
-        /// 
+        ///
         /// throws CryptoException if the zero knowledge proof is not correct
         /// </summary>
         public static void ValidateZeroKnowledgeProof(BigInteger p, BigInteger q, BigInteger g,
@@ -211,14 +259,57 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
         /// Calculates the keying material, which can be done after round 2 has completed.
         /// A session key must be derived from this key material using a secure key derivation function (KDF).
         /// The KDF used to derive the key is handled externally (i.e. not by JPAKEParticipant).
-        /// 
+        ///
         /// KeyingMaterial = (B/g^{x2*x4*s})^x2
         /// </summary>
-        public static BigInteger CalculateKeyingMaterial(BigInteger p, BigInteger q, 
+        public static BigInteger CalculateKeyingMaterial(BigInteger p, BigInteger q,
             BigInteger gx4, BigInteger x2, BigInteger s, BigInteger B)
         {
-            return gx4.ModPow(x2.Multiply(s).Negate().Mod(q), p).ModMultiply(B, p).ModPow(x2, p);
+            return CalculateKeyingMaterial(p, q, gx4, x2, s, B, null);
         }
+
+        /// <summary>
+        /// Calculates the keying material, which can be done after round 2 has completed.
+        /// A session key must be derived from this key material using a secure key derivation function (KDF).
+        /// The KDF used to derive the key is handled externally (i.e. not by JPAKEParticipant).
+        ///
+        /// KeyingMaterial = (B/g^{x2*x4*s})^x2
+        /// </summary>
+        /// <remarks>
+        /// One exponent carries the password and the other the private ephemeral x2, so both are blinded with a random
+        /// multiple of q. gx4 and B must each have order q, as checked by <see cref="ValidateZeroKnowledgeProof"/>, so
+        /// the product raised by the second exponentiation does too.
+        /// </remarks>
+        /// <param name="p">The prime modulus.</param>
+        /// <param name="q">The prime order of the group.</param>
+        /// <param name="gx4">The other participant's g^x4.</param>
+        /// <param name="x2">This participant's private x2.</param>
+        /// <param name="s">The password, from CalculateS.</param>
+        /// <param name="B">The other participant's round 2 value.</param>
+        /// <param name="random">The source of the blinding, or null for the default.</param>
+        public static BigInteger CalculateKeyingMaterial(BigInteger p, BigInteger q,
+            BigInteger gx4, BigInteger x2, BigInteger s, BigInteger B, SecureRandom random)
+        {
+            // -(x2 * s) mod q in fixed time, as both carry secrets
+            x2 = Reduce(q, x2);
+            BigInteger x2s = BigIntegers.ModMult(q, x2, Reduce(q, s));
+            BigInteger negX2s = BlindExponent(BigIntegers.ModSubtract(q, Zero, x2s), q, random);
+
+            return gx4.ModPow(negX2s, p).ModMultiply(B, p).ModPow(BlindExponent(x2, q, random), p);
+        }
+
+        // A private exponent gets a random multiple of the group order added before the variable-time ModPow, so the
+        // exponent differs on each call. Every base J-PAKE raises has order q: g is checked with g^q = 1 when the
+        // JPakePrimeOrderGroup is built, and each value received from the other participant is checked the same way
+        // by ValidateZeroKnowledgeProof before it is used as a base. That makes a multiple of q sound, and it matters
+        // for cost: the exponents are the size of q, so a multiple of p - 1 would grow them to the size of p.
+        // The fixed-time helpers need operands in [0, q). JPakeParticipant only ever passes such values, so the
+        // variable-time reduction here serves only direct callers passing values outside that range.
+        private static BigInteger Reduce(BigInteger q, BigInteger x) =>
+            x.SignValue < 0 || x.CompareTo(q) >= 0 ? x.Mod(q) : x;
+
+        private static BigInteger BlindExponent(BigInteger e, BigInteger order, SecureRandom random) =>
+            BigIntegers.CreateBlindedExponent(e, order, CryptoServicesRegistrar.GetSecureRandom(random));
 
         /// <summary>
         /// Validates that the given participant ids are not equal.
@@ -311,7 +402,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
 
         /// <summary>
         /// Calculates the MacKey (i.e. the key to use when calculating the MagTag for key confirmation).
-        /// 
+        ///
         /// MacKey = H(K || "JPAKE_KC")
         /// </summary>
         private static byte[] CalculateMacKey(BigInteger keyingMaterial, IDigest digest)
@@ -329,7 +420,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
 
         /// <summary>
         /// Validates the MacTag received from the partner participant.
-        /// 
+        ///
         /// throws CryptoException if the participantId strings are equal.
         /// </summary>
         public static void ValidateMacTag(string participantId, string partnerParticipantId,
@@ -339,7 +430,7 @@ namespace Org.BouncyCastle.Crypto.Agreement.JPake
             /*
              * Calculate the expected MacTag using the parameters as the partner
              * would have used when the partner called calculateMacTag.
-             * 
+             *
              * i.e. basically all the parameters are reversed.
              * participantId <-> partnerParticipantId
              *            x1 <-> x3

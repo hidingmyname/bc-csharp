@@ -16,6 +16,7 @@ namespace Org.BouncyCastle.Crypto.Engines
         private bool forEncryption;
         private int bitSize;
 
+        /// <inheritdoc/>
         public virtual string AlgorithmName => "ElGamal";
 
         /// <summary>Initialise the ElGamal engine.</summary>
@@ -24,7 +25,8 @@ namespace Org.BouncyCastle.Crypto.Engines
         public virtual void Init(bool forEncryption, ICipherParameters parameters)
         {
             this.key = (ElGamalKeyParameters)ParameterUtilities.GetRandom(parameters, out var providedRandom);
-            this.random = forEncryption ? CryptoServicesRegistrar.GetSecureRandom(providedRandom) : null;
+            // needed on both paths: decryption blinds the base it raises to the private key
+            this.random = CryptoServicesRegistrar.GetSecureRandom(providedRandom);
 
             this.forEncryption = forEncryption;
             this.bitSize = key.Parameters.P.BitLength;
@@ -107,9 +109,15 @@ namespace Org.BouncyCastle.Crypto.Engines
                     throw new ArgumentException("ElGamal ciphertext element is weak");
                 }
 
-                // a shortcut, which generally relies on p being prime amongst other things.
-                // if a problem with this shows up, check the p and g values!
-                BigInteger m = gamma.ModPow(pSub1.Subtract(priv.X), p).ModMultiply(phi, p);
+                // m = gamma^-x * phi. gamma is caller-supplied and the exponent is the (potentially reused) private
+                // key, so the base is blinded: the timing of the variable-time ModPow could otherwise be accumulated
+                // against the key over many decryptions. gamma is public, so it is inverted first, in variable time,
+                // which leaves x itself as the exponent rather than p - 1 - x, the size of p however short x is. This
+                // relies on p being prime; if a problem shows up, check the p and g values! The product with phi is
+                // the plaintext, so it is formed in fixed time.
+                BigInteger gammaInv = BigIntegers.ModOddInverseVar(p, gamma);
+                BigInteger shared = BigIntegers.ModPowBaseBlinded(p, gammaInv, priv.X, random);
+                BigInteger m = BigIntegers.ModMult(p, shared, phi);
 
                 return BigIntegers.AsUnsignedByteArray(m);
             }

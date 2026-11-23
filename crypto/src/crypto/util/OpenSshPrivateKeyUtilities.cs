@@ -5,6 +5,7 @@ using Org.BouncyCastle.Asn1;
 using Org.BouncyCastle.Asn1.Pkcs;
 using Org.BouncyCastle.Asn1.Sec;
 using Org.BouncyCastle.Asn1.X9;
+using Org.BouncyCastle.Crypto.Generators;
 using Org.BouncyCastle.Crypto.Parameters;
 using Org.BouncyCastle.Math;
 using Org.BouncyCastle.Pkcs;
@@ -12,6 +13,7 @@ using Org.BouncyCastle.Utilities;
 
 namespace Org.BouncyCastle.Crypto.Utilities
 {
+    /// <summary>Utility methods for reading and writing private keys in the OpenSSH format.</summary>
     public static class OpenSshPrivateKeyUtilities
     {
         /// <summary>Magic value for proprietary OpenSSH private key.</summary>
@@ -47,8 +49,7 @@ namespace Org.BouncyCastle.Crypto.Utilities
                     new DerInteger(dsaparameters.G)
                 };
 
-                // public key = g.modPow(x, p);
-                BigInteger pubKey = dsaparameters.P.ModPow(dsaPrivateKey.X, dsaparameters.P);
+                BigInteger pubKey = DsaKeyPairGenerator.CalculatePublicKey(dsaparameters, dsaPrivateKey.X);
                 vec.Add(new DerInteger(pubKey));
                 vec.Add(new DerInteger(dsaPrivateKey.X));
                 try

@@ -1,0 +1,203 @@
+using System;
+
+using NUnit.Framework;
+
+using Org.BouncyCastle.Asn1.CryptoPro;
+using Org.BouncyCastle.Crypto.Agreement.JPake;
+using Org.BouncyCastle.Crypto.Digests;
+using Org.BouncyCastle.Crypto.Generators;
+using Org.BouncyCastle.Crypto.Parameters;
+using Org.BouncyCastle.Crypto.Signers;
+using Org.BouncyCastle.Math;
+using Org.BouncyCastle.Security;
+
+namespace Org.BouncyCastle.Crypto.Tests
+{
+    /// <summary>
+    /// Private exponents are blinded with a random multiple of the group order before the variable-time ModPow. The
+    /// blinding multiple is the only single-byte draw these paths make, so counting such draws shows the blinding
+    /// ran; the results must be unchanged.
+    /// </summary>
+    [TestFixture]
+    public class ExponentBlindingTest
+    {
+        private static readonly SecureRandom Random = new SecureRandom();
+
+        // RFC 6979 A.2.1
+        private static readonly DsaParameters DsaParams = new DsaParameters(
+            new BigInteger("86F5CA03DCFEB225063FF830A0C769B9DD9D6153AD91D7CE27F787C43278B447" +
+                           "E6533B86B18BED6E8A48B784A14C252C5BE0DBF60B86D6385BD2F12FB763ED88" +
+                           "73ABFD3F5BA2E0A8C0A59082EAC056935E529DAF7C610467899C77ADEDFC846C" +
+                           "881870B7B19B2B58F9BE0521A17002E3BDD6B86685EE90B3D9A1B02B782B1779", 16),
+            new BigInteger("996F967F6C8E388D9E28D01E205FBA957A5698B1", 16),
+            new BigInteger("07B0F92546150B62514BB771E2A0C0CE387F03BDA6C56B505209FF25FD3C133D" +
+                           "89BBCD97E904E09114D9A7DEFDEADFC9078EA544D2E401AEECC40BB9FBBF78FD" +
+                           "87995A10A1C27CB7789B594BA7EFB5C4326A9FE59A070E136DB77175464ADCA4" +
+                           "17BE5DCE2F40D10A46A3A3943F26AB7FD9C0398FF8C76EE0A56826A8A88F1DBD", 16));
+
+        [Test]
+        public void Dsa()
+        {
+            AsymmetricCipherKeyPair kp = GenerateDsaKeyPair();
+            byte[] digest = RandomDigest(20);
+
+            var counting = new CountingRandom();
+            var signer = new DsaSigner();
+            signer.Init(true, new ParametersWithRandom(kp.Private, counting));
+            BigInteger[] sig = signer.GenerateSignature(digest);
+            Assert.AreEqual(1, counting.Count, "blinding draws");
+
+            var verifier = new DsaSigner();
+            verifier.Init(false, kp.Public);
+            Assert.IsTrue(verifier.VerifySignature(digest, sig[0], sig[1]));
+        }
+
+        [Test]
+        public void DsaDeterministic()
+        {
+            AsymmetricCipherKeyPair kp = GenerateDsaKeyPair();
+            byte[] digest = RandomDigest(20);
+
+            var counting = new CountingRandom();
+            var signer = new DsaSigner(new HMacDsaKCalculator(new Sha256Digest()));
+            signer.Init(true, new ParametersWithRandom(kp.Private, counting));
+            BigInteger[] sig1 = signer.GenerateSignature(digest);
+            BigInteger[] sig2 = signer.GenerateSignature(digest);
+
+            // the nonce draws nothing, but the blinding still does, without disturbing determinism
+            Assert.AreEqual(2, counting.Count, "blinding draws");
+            Assert.AreEqual(sig1[0], sig2[0]);
+            Assert.AreEqual(sig1[1], sig2[1]);
+
+            var verifier = new DsaSigner();
+            verifier.Init(false, kp.Public);
+            Assert.IsTrue(verifier.VerifySignature(digest, sig1[0], sig1[1]));
+        }
+
+        [Test]
+        public void Gost3410_94()
+        {
+            var kpGen = new Gost3410KeyPairGenerator();
+            kpGen.Init(new Gost3410KeyGenerationParameters(Random, CryptoProObjectIdentifiers.GostR3410x94CryptoProA));
+            AsymmetricCipherKeyPair kp = kpGen.GenerateKeyPair();
+            byte[] digest = RandomDigest(32);
+
+            var counting = new CountingRandom();
+            var signer = new Gost3410Signer();
+            signer.Init(true, new ParametersWithRandom(kp.Private, counting));
+            BigInteger[] sig = signer.GenerateSignature(digest);
+            Assert.AreEqual(1, counting.Count, "blinding draws");
+
+            var verifier = new Gost3410Signer();
+            verifier.Init(false, kp.Public);
+            Assert.IsTrue(verifier.VerifySignature(digest, sig[0], sig[1]));
+        }
+
+        [Test]
+        public void JPake()
+        {
+            JPakePrimeOrderGroup group = JPakePrimeOrderGroups.SUN_JCE_1024;
+            char[] password = "password".ToCharArray();
+
+            var counting = new CountingRandom();
+            var alice = new JPakeParticipant("alice", password, group, new Sha256Digest(), counting);
+            var bob = new JPakeParticipant("bob", password, group, new Sha256Digest(), Random);
+
+            // g^x1, g^x2 and the commitment in each of their two proofs
+            JPakeRound1Payload aliceRound1 = alice.CreateRound1PayloadToSend();
+            Assert.AreEqual(4, counting.Count, "round 1 blinding draws");
+            JPakeRound1Payload bobRound1 = bob.CreateRound1PayloadToSend();
+            alice.ValidateRound1PayloadReceived(bobRound1);
+            bob.ValidateRound1PayloadReceived(aliceRound1);
+
+            // A and the commitment in its proof
+            counting.Count = 0;
+            JPakeRound2Payload aliceRound2 = alice.CreateRound2PayloadToSend();
+            Assert.AreEqual(2, counting.Count, "round 2 blinding draws");
+            JPakeRound2Payload bobRound2 = bob.CreateRound2PayloadToSend();
+            alice.ValidateRound2PayloadReceived(bobRound2);
+            bob.ValidateRound2PayloadReceived(aliceRound2);
+
+            // the two exponentiations of the keying material
+            counting.Count = 0;
+            BigInteger aliceKeyingMaterial = alice.CalculateKeyingMaterial();
+            Assert.AreEqual(2, counting.Count, "keying material blinding draws");
+            Assert.AreEqual(bob.CalculateKeyingMaterial(), aliceKeyingMaterial);
+        }
+
+        [Test]
+        public void JPakeUtilitiesUnchanged()
+        {
+            JPakePrimeOrderGroup group = JPakePrimeOrderGroups.SUN_JCE_1024;
+            BigInteger p = group.P, q = group.Q, g = group.G;
+
+            BigInteger x = JPakeUtilities.GenerateX2(q, Random);
+            BigInteger gx = g.ModPow(x, p);
+
+            var counting = new CountingRandom();
+            Assert.AreEqual(gx, JPakeUtilities.CalculateGx(p, q, g, x, counting));
+            Assert.AreEqual(1, counting.Count, "CalculateGx blinding draws");
+#pragma warning disable CS0618 // Type or member is obsolete
+            Assert.AreEqual(gx, JPakeUtilities.CalculateGx(p, g, x));
+#pragma warning restore CS0618 // Type or member is obsolete
+
+            BigInteger gA = g.ModPow(JPakeUtilities.GenerateX2(q, Random), p);
+            BigInteger x2s = JPakeUtilities.GenerateX2(q, Random);
+            BigInteger A = gA.ModPow(x2s, p);
+            Assert.AreEqual(A, JPakeUtilities.CalculateA(p, q, gA, x2s, null));
+            Assert.AreEqual(A, JPakeUtilities.CalculateA(p, q, gA, x2s));
+
+            BigInteger gx4 = g.ModPow(JPakeUtilities.GenerateX2(q, Random), p);
+            BigInteger x2 = JPakeUtilities.GenerateX2(q, Random);
+            BigInteger s = JPakeUtilities.CalculateS(q, "password".ToCharArray());
+            BigInteger B = g.ModPow(JPakeUtilities.GenerateX2(q, Random), p);
+            BigInteger keyingMaterial = gx4.ModPow(x2.Multiply(s).Negate().Mod(q), p).ModMultiply(B, p).ModPow(x2, p);
+            Assert.AreEqual(keyingMaterial, JPakeUtilities.CalculateKeyingMaterial(p, q, gx4, x2, s, B, null));
+            Assert.AreEqual(keyingMaterial, JPakeUtilities.CalculateKeyingMaterial(p, q, gx4, x2, s, B));
+        }
+
+        private static AsymmetricCipherKeyPair GenerateDsaKeyPair()
+        {
+            var kpGen = new DsaKeyPairGenerator();
+            kpGen.Init(new DsaKeyGenerationParameters(Random, DsaParams));
+            return kpGen.GenerateKeyPair();
+        }
+
+        private static byte[] RandomDigest(int length)
+        {
+            byte[] digest = new byte[length];
+            Random.NextBytes(digest);
+            return digest;
+        }
+
+        /// <summary>
+        /// Counts blinding draws only: the blinding multiple is seven bits, so it is the only single-byte request
+        /// these paths make.
+        /// </summary>
+        private sealed class CountingRandom
+            : SecureRandom
+        {
+            internal int Count;
+
+            public override void NextBytes(byte[] buf)
+            {
+                if (buf.Length == 1)
+                {
+                    ++Count;
+                }
+                base.NextBytes(buf);
+            }
+
+#if NET6_0_OR_GREATER || NETSTANDARD2_1_OR_GREATER
+            public override void NextBytes(Span<byte> buffer)
+            {
+                if (buffer.Length == 1)
+                {
+                    ++Count;
+                }
+                base.NextBytes(buffer);
+            }
+#endif
+        }
+    }
+}
